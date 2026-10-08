@@ -319,14 +319,7 @@
     const nav = root.navigator || {};
     const isIOS = /iPhone|iPad|iPod/.test(nav.userAgent || "")
       || (nav.platform === "MacIntel" && nav.maxTouchPoints > 1);
-    let file = null;
-    try { file = new root.File([csv], filename, { type: "text/csv" }); } catch (e) { file = null; }
-    if (file && nav.canShare && nav.canShare({ files: [file] })) {
-      nav.share({ files: [file], title: filename })
-        .then(() => { state.saved = true; })
-        .catch((e) => { if (!e || e.name !== "AbortError") showCsvText(csv, filename); });
-      return;
-    }
+    // iPhone は端末ごとに保存の効き方が違うので、まず中身の画面を出し、そこから「コピー」「ファイルで共有」を選ぶ
     if (isIOS) { showCsvText(csv, filename); return; }
     const blob = new root.Blob([csv], { type: "text/csv" });
     const url = root.URL.createObjectURL(blob);
@@ -356,7 +349,7 @@
       + '<textarea readonly style="width:100%;height:40vh;font-size:11px;font-family:monospace"></textarea>'
       + '<div style="display:flex;gap:8px;margin-top:10px">'
       + '<button type="button" data-act="copy" class="button secondary" style="flex:1">コピー</button>'
-      + '<button type="button" data-act="share" class="button ghost" style="flex:1">共有</button>'
+      + '<button type="button" data-act="share" class="button ghost" style="flex:1">ファイルで共有</button>'
       + '<button type="button" data-act="close" class="button ghost" style="flex:1">閉じる</button></div></div>';
     const ta = box.querySelector("textarea");
     ta.value = csv;
@@ -375,8 +368,16 @@
         ev.target.textContent = ok ? "コピーしました" : "長押しで全選択→コピー";
         if (ok) state.saved = true;
       }
-      if (act === "share") {
-        try { await nav.share({ title: filename, text: csv }); state.saved = true; } catch (e) { /* 取り消し */ }
+        if (act === "share") {
+        let file = null;
+        try { file = new root.File([csv], filename, { type: "text/csv" }); } catch (e) { file = null; }
+        try {
+          if (file && nav.canShare && nav.canShare({ files: [file] })) await nav.share({ files: [file], title: filename });
+          else await nav.share({ title: filename, text: csv });
+          state.saved = true;
+        } catch (e) {
+          if (!e || e.name !== "AbortError") ev.target.textContent = "共有できません→コピーへ";
+        }
       }
     });
     document.body.appendChild(box);
