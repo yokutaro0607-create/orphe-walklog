@@ -264,6 +264,7 @@
     keepAwake(true);
     notifyCG("reset");
     state.rows = { left: [], right: [] };
+    resetFlow();
     state.recording = true;
     state.complete = false;
     state.startedAt = Date.now();
@@ -292,6 +293,7 @@
   function clearData() {
     notifyCG("reset");
     state.rows = { left: [], right: [] };
+    resetFlow();
     state.recording = false;
     state.complete = false;
     state.startedAt = null;
@@ -864,6 +866,55 @@
       : t("noData");
   }
 
+  // ---- 足裏の流れ（かかと→小指→親指）。圧力6点の生データを1歩ずつ数える（flow.js）
+  const Flow = root.FootFlow || null;
+  const flowAnalyzers = [null, null];
+  function emptyFlow() { const c = {}; if (Flow) for (const k of Flow.ORDER) c[k] = 0; return c; }
+  function resetFlow() {
+    state.flow = { left: emptyFlow(), right: emptyFlow() };
+    if (Flow) for (const id of DEVICE_IDS) flowAnalyzers[id] = Flow.createAnalyzer();
+  }
+  resetFlow();
+  let flowRenderTimer = null;
+  function attachFlow(deviceId) {
+    const ins = root.insoles && root.insoles[deviceId];
+    if (!Flow || !ins || ins._walklogFlow || typeof ins.addSensorDataListener !== "function") return;
+    ins._walklogFlow = true;
+    ins.addSensorDataListener((ev) => {
+      const samples = ev && ev.packet && ev.packet.samples;
+      if (!Array.isArray(samples)) return;
+      const an = flowAnalyzers[deviceId];
+      for (const s of samples) {
+        if (!s || !s.press || !s.press.values) continue;
+        const t = Number.isFinite(s.timestamp) ? s.timestamp : ev.receivedAt;
+        const kind = an.push(s.press.values, t);
+        if (kind && state.recording && state.sessionSource !== "demo") {
+          const side = state.deviceSides[deviceId];
+          if (state.flow[side] && kind in state.flow[side]) state.flow[side][kind]++;
+          if (!flowRenderTimer) flowRenderTimer = root.setTimeout(() => { flowRenderTimer = null; renderFlow(); }, 500);
+        }
+      }
+    });
+  }
+  function renderFlow() {
+    const box = root.document.getElementById("flow-panel");
+    if (!box || !Flow) return;
+    const sideName = { left: "左足", right: "右足" };
+    const cols = SIDES.map((side) => {
+      const c = state.flow[side];
+      const n = Flow.ORDER.reduce((a, k) => a + c[k], 0);
+      if (n === 0) return `<div class="chain-col"><h3>${sideName[side]}</h3><p class="chain-mix">まだ数えた歩がありません。</p></div>`;
+      const pct = (k) => Math.round(c[k] / n * 100);
+      const rows = Flow.ORDER.filter((k) => c[k] > 0).map((k) =>
+        `<li><span class="chain-tag ${k === "ideal" ? "measured" : "none"}">${pct(k)}%</span>${Flow.LABELS[k]}（${c[k]}歩）</li>`);
+      return `<div class="chain-col"><h3>${sideName[side]}（${n}歩）</h3><p class="chain-mix">かかと→小指→親指の順だった歩：<b>${pct("ideal")}%</b></p><ol>${rows.join("")}</ol></div>`;
+    });
+    box.innerHTML = '<h2>足裏の流れ（かかと→小指→親指）</h2>'
+      + '<p class="chain-lead">整った歩きは、かかと→小指→親指の順に着きます。足裏の圧力センサーで、1歩ごとにどこへ先に乗ったかを数えています（インソールで測った値）。</p>'
+      + `<div class="chain-cols">${cols.join("")}</div>`
+      + '<p class="chain-note">小指側＝中足部の外側、親指側＝つま先の内側と母趾球の内側のセンサー。立ち止まっている間は数えません。デモでは数えません。</p>';
+  }
+
   // ---- 代償運動とのつながり（連続記録版の追加）
   // 測っているのは①（着地の足の倒れ方）だけ。②〜⑦は社内の連動の考え方
   // （距骨→アーチ→すね→膝→骨盤→腰→肋骨。3D解剖ビューアと同じ並び）による理屈での見立て。
@@ -919,6 +970,7 @@
 
   function renderReport() {
     renderChain();
+    renderFlow();
     const report = Stats.buildReport(state.rows, TARGET);
     renderReportHead(report);
     renderStatGrid(report);
@@ -957,6 +1009,7 @@
     root.addEventListener("gait-report:languagechange", refreshLanguage);
 
     for (const deviceId of DEVICE_IDS) installDevice(deviceId);
+    root.setInterval(() => { for (const id of DEVICE_IDS) attachFlow(id); }, 1000);
     updateConnectionSource();
     renderAll();
 
