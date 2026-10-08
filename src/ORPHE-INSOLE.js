@@ -1,0 +1,2370 @@
+var orphe_js_version_date = `
+Last modified: 2026/09/06 00:00:00
+`;
+/**
+ORPHE-INSOLE.js is javascript library for ORPHE INSOLE Module, inspired by BlueJelly.js
+Class形式で記述を変更したバージョン
+v1.2.1 クォータニオンのQ14スケール修正、Euler変換前の正規化
+v1.1.0 接続安定化（デバイス記憶・高速再接続・自動再接続）、クラス名を OrpheInsole に変更（Orphe はエイリアスとして維持）
+v0.9.0 ベータ版
+@module OrpheInsole
+@author Tetsuaki BABA
+@version 1.3.4
+
+@description
+## センサ座標系と圧力センサ配置 / Sensor frame and pressure sensor placement
+
+ORPHE INSOLE のセンサ座標系は右手系（Z-up）です。
+The sensor frame of ORPHE INSOLE is right-handed, Z-up.
+
+- Y: つま先方向（インソール長軸方向） / toe direction (long axis of the insole)
+- X: つま先方向に向かって右 / to the right of the toe direction
+- Z: インソール上面の法線方向（上向き）。静止時の変換済み加速度zは約+1G /
+  normal of the insole top surface (upward); converted accZ reads about +1G at rest
+
+圧力センサは左右各6点（公式番号: 1 つま先内側, 2 母趾球内側, 3 つま先外側,
+4 中足部中央, 5 中足部外側, 6 踵）。gotPress の press.values[i] は番号 i+1 に対応します。
+Six pressure sensors per foot (official numbering: 1 toe-medial, 2 ball-medial,
+3 toe-lateral, 4 ball-center, 5 midfoot-lateral, 6 heel);
+press.values[i] corresponds to sensor i+1.
+
+図解 / figure: https://orphe-oss.github.io/ORPHE-INSOLE.js/demo-app/#coords
+
+@see https://github.com/Orphe-OSS/ORPHE-INSOLE.js
+*/
+
+// 同梱ライブラリ用の <script> 挿入。同一ファイル名が既に読み込まれていれば何もしない。
+// 同一 origin の相対 URL しか扱わないので crossorigin は付けない（file:// で開いたときに
+// オペーク origin の CORS 失敗でスクリプトが実行されない事故を避ける）。
+// グローバル名は ORPHE-CORE.js の loadScript と衝突しないよう INSOLE 固有にする。
+function _orpheInsoleLoadScript(src) {
+  if (typeof document === 'undefined') return;
+  const fileName = src.split('/').pop();
+  if (fileName) {
+    const already = Array.from(document.scripts).some(s => {
+      if (!s.src) return false;
+      return s.src === src || s.src.endsWith('/' + fileName);
+    });
+    if (already) return;
+  }
+  const script = document.createElement('script');
+  script.src = src;
+  script.type = 'text/javascript';
+  document.head.appendChild(script);
+}
+
+// 同梱ライブラリ（src/vendor/）の自動読み込み
+//
+// gotEuler の四元数→オイラー角変換に Quaternion.js（src/vendor/quaternion.js、MIT）を使う。
+//  - dist/orphe-insole(.min).js には scripts/build-dist.js が quaternion.js を同梱しているので、
+//    グローバル Quaternion が既に定義されておりここでは何もしない。
+//  - src/ORPHE-INSOLE.js を直接読み込むページ（examples 等）では、このスクリプト自身の URL を基準に
+//    vendor/quaternion.js を相対パスでロードする（../../src/ORPHE-INSOLE.js → ../../src/vendor/quaternion.js）。
+//  - 同一ページで ORPHE-CORE.js が先に quaternion.js を読み込んでいれば（Quaternion 定義済み）何もしない。
+//  - type="module" やインライン評価などで自身の URL が取れない場合は何もしない（gotEuler は呼ばれないが他は動作する）。
+// 以前は ORPHE-CORE.js リポジトリの jsDelivr URL（@main → @v1.4.x）から quaternion.js / float16.min.js を
+// ロードしていたが、別リポジトリのコードを実行時に取り込む構造を無くすため v1.3.4 で廃止した
+// （float16 は INSOLE 未使用。半精度は src/InsoleGait.js の f16be でデコードする）。
+var _orpheInsoleScriptBase = (function () {
+  if (typeof document === 'undefined' || !document.currentScript || !document.currentScript.src) return null;
+  return String(document.currentScript.src).replace(/[?#].*$/, '').replace(/[^/]*$/, '');
+})();
+
+function _orpheInsoleAutoLoadOptionalLibs() {
+  if (typeof Quaternion !== 'undefined') return;
+  if (!_orpheInsoleScriptBase) return;
+  _orpheInsoleLoadScript(_orpheInsoleScriptBase + 'vendor/quaternion.js');
+}
+if (typeof document !== 'undefined') {
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _orpheInsoleAutoLoadOptionalLibs, { once: true });
+  } else {
+    _orpheInsoleAutoLoadOptionalLibs();
+  }
+}
+
+// ── ライブラリ本体 ────────────────────────────────────────────────
+// ORPHE-CORE.js と同一ページで共存できるよう、クラス宣言
+// (FixedSizeArray, OrpheTimestamp など) をトップレベルに置かず IIFE で包む。
+// トップレベルの class 宣言はグローバルなレキシカル束縛を作るため、
+// CORE と INSOLE の両方を読み込むと SyntaxError で後勝ちスクリプト全体が死ぬ。
+(function (global) {
+
+/**
+ * 自動的に決められた配列サイズでunshiftしてくれるクラス
+ * sensor valuesのデータを保持するクラスです。sensor valuesのデータは、加速度、ジャイロ、クォータニオンの3つのデータを保持します。interpotion処理を行うために、過去のデータを保持する用途に使用します。
+ */
+class FixedSizeArray {
+  constructor(size) {
+    this.size = size;
+    this.array = [];
+  }
+  setSize(size) {
+    this.size = size;
+  }
+  push(element) {
+    if (this.array.length >= this.size) {
+      this.array.shift(); // 先頭の要素を削除
+    }
+    this.array.push(element); // 新しい要素を追加
+  }
+
+  getArray() {
+    return this.array;
+  }
+}
+
+
+
+
+/**
+ * Orpheクラス内部で利用されるタイムスタンプクラスです。BLE通信のデータ取得タイミングにおける実測周波数を取得するために利用されます。Orpheクラス内部で本当は宣言したかったのですが、jsdoc がクラス内部クラス定義に対応していないため、外部に出しています。無念。
+ * @class
+ */
+class OrpheTimestamp {
+  /**
+   * タイムスタンプクラスのコンストラクタです。
+   */
+  constructor() {
+    this.start = 0;
+  }
+
+  /**
+   * 前回呼び出した時刻からの経過時間をミリ秒で返します。
+   * @returns {number} 前回呼び出した時刻からの経過時間をミリ秒で返します。
+   */
+  millis() {
+    const blenow = performance.now();
+    let diff = (blenow - this.start);
+    this.start = blenow;
+    return diff;
+  }
+  /**
+   * 前回呼び出した時刻からの経過時間を周波数として返します。
+   * @returns {float} 周波数[Hz]
+   */
+  getHz() {
+    let t = this.millis();
+    if (t <= 15) return -1;
+    else return 1000 / t;
+  }
+}
+
+function _orpheInsoleTimestampToday(hours, minutes, seconds, milliseconds) {
+  const now = new Date();
+  now.setHours(hours);
+  now.setMinutes(minutes);
+  now.setSeconds(seconds);
+  now.setMilliseconds(milliseconds);
+  return now.getTime();
+}
+
+function _orpheInsoleNormalizeQuaternion(quat) {
+  const norm = Math.hypot(quat.w, quat.x, quat.y, quat.z);
+  if (!Number.isFinite(norm) || norm <= Number.EPSILON) {
+    return { w: 0, x: 0, y: 0, z: 0 };
+  }
+  return {
+    w: quat.w / norm,
+    x: quat.x / norm,
+    y: quat.y / norm,
+    z: quat.z / norm
+  };
+}
+
+// DEVICE_INFORMATION は acc/gyro のレンジ設定を index（0..3）で持つ一方、
+// パーサ API は物理フルスケール値を受け取る。公開コールバックの形を変えないよう
+// 変換テーブルはモジュール内の私有定数として持つ。
+const _ORPHE_INSOLE_ACC_RANGES = Object.freeze([2, 4, 8, 16]);
+const _ORPHE_INSOLE_GYRO_RANGES = Object.freeze([250, 500, 1000, 2000]);
+// LSM6DSOX のジャイロ代表感度はフルスケール 1 dps あたり 0.035 mdps/LSB
+// （±250/500/1000/2000 dps で 8.75/17.5/35/70 mdps/LSB）。
+// raw int16 を理想 Q15（raw/32768*range）として扱うと ±2000 dps で 61.035 mdps/LSB となり、
+// データシート感度より約 12.8% 小さい物理値になるため、感度側を正とする。
+const _ORPHE_INSOLE_GYRO_DPS_PER_LSB_PER_RANGE = 0.000035;
+
+// setting は getUint8 由来の number のみ受け付ける。device_information の初期値は
+// 空文字なので、Number('') === 0 の暗黙変換で index 0（±2G / ±250dps）と
+// 誤判定しないよう型で弾く。
+function _orpheInsoleRangeFromSetting(ranges, setting, fallback) {
+  return typeof setting === 'number' && Number.isInteger(setting)
+    && setting >= 0 && setting < ranges.length
+    ? ranges[setting]
+    : fallback;
+}
+
+/**
+ * code プロパティ付き Error を生成する（エラー種別のプログラム判定用）。
+ * message は従来の文字列エラーと同一文字列を維持する（後方互換）。
+ * @param {string} code 'NO_DEVICE' | 'ALREADY_DISCONNECTED' | 'CONNECT_TIMEOUT' | 'INVALID_MODE'
+ * @param {string} message
+ * @returns {Error}
+ */
+function _insoleError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+/**
+ * SENSOR_VALUES のリアルタイム配信モード仕様。
+ * UI・Toolkit・アプリが同じ名称と期待データを使えるよう、コアSDKを正とする。
+ */
+const ORPHE_INSOLE_STREAMING_MODES = Object.freeze({
+  1: Object.freeze({
+    id: 1,
+    sampleHz: 200,
+    packetHz: 50,
+    fields: Object.freeze({ quat: true, gyro: true, acc: true, press: false }),
+    label: 'Orientation 200 Hz',
+  }),
+  3: Object.freeze({
+    id: 3,
+    sampleHz: 200,
+    packetHz: 50,
+    fields: Object.freeze({ quat: false, gyro: true, acc: true, press: true }),
+    label: 'Pressure + IMU 200 Hz',
+  }),
+  4: Object.freeze({
+    id: 4,
+    sampleHz: 100,
+    packetHz: 50,
+    fields: Object.freeze({ quat: true, gyro: true, acc: true, press: true }),
+    label: 'Full sensor 100 Hz',
+  }),
+});
+
+/**
+ * ORPHE INSOLE SENSOR_VALUES packet parser.
+ * @param {DataView} data
+ * @param {object} options
+ * @param {number} [options.gyroRange=2000] ジャイロのフルスケール[dps]。物理値換算の感度に使う。
+ * @param {number} [options.accRange=16] 加速度のフルスケール[G]。
+ * @returns {object|null}
+ */
+function parseInsoleSensorValues(data, options = {}) {
+  if (!data || typeof data.getUint8 !== 'function') {
+    throw new TypeError('parseInsoleSensorValues expects a DataView');
+  }
+  if (data.byteLength !== 104) return null;
+
+  const header = data.getUint8(0);
+  const serial_number = data.getUint16(1);
+  const gyroRange = Number.isFinite(Number(options.gyroRange)) ? Number(options.gyroRange) : 2000;
+  const accRange = Number.isFinite(Number(options.accRange)) ? Number(options.accRange) : 16;
+  // deg/s per LSB（例: ±2000 dps → 0.07）。正規化値ではなく raw int16 に掛ける。
+  const gyroDpsPerLsb = gyroRange * _ORPHE_INSOLE_GYRO_DPS_PER_LSB_PER_RANGE;
+  const t_start = _orpheInsoleTimestampToday(
+    data.getUint8(3),
+    data.getUint8(4),
+    data.getUint8(5),
+    data.getUint16(6)
+  );
+  const samples = [];
+  // INSOLE packets encode quaternion components as signed Q14 (1.0 = 16384).
+  // acc/gyro の正規化コールバック（gotAcc/gotGyro）は後方互換のため raw int16 / 32768
+  // のまま。gyro の物理値だけがレンジ別のセンサー感度で換算される。
+  const quatScale = 16384;
+
+  function vector3(x, y, z, timestamp, packet_number) {
+    return {
+      x: data.getInt16(x) / 32768,
+      y: data.getInt16(y) / 32768,
+      z: data.getInt16(z) / 32768,
+      timestamp,
+      serial_number,
+      packet_number
+    };
+  }
+
+  function quat(w, x, y, z, timestamp, packet_number) {
+    return {
+      w: data.getInt16(w) / quatScale,
+      x: data.getInt16(x) / quatScale,
+      y: data.getInt16(y) / quatScale,
+      z: data.getInt16(z) / quatScale,
+      timestamp,
+      serial_number,
+      packet_number
+    };
+  }
+
+  function withConverted(sample) {
+    if (sample.gyro) {
+      // sample.gyro.* は raw int16 / 32768。×32768 で raw に戻してから感度を掛ける。
+      sample.converted_gyro = {
+        x: sample.gyro.x * 32768 * gyroDpsPerLsb,
+        y: sample.gyro.y * 32768 * gyroDpsPerLsb,
+        z: sample.gyro.z * 32768 * gyroDpsPerLsb,
+        timestamp: sample.timestamp,
+        serial_number,
+        packet_number: sample.packet_number
+      };
+    }
+    if (sample.acc) {
+      sample.converted_acc = {
+        x: sample.acc.x * accRange,
+        y: sample.acc.y * accRange,
+        z: sample.acc.z * accRange,
+        timestamp: sample.timestamp,
+        serial_number,
+        packet_number: sample.packet_number
+      };
+    }
+    return sample;
+  }
+
+  if (header === 50) {
+    let timestamp = t_start;
+    for (let i = 3; i >= 0; i--) {
+      if (i !== 3) timestamp += data.getUint8(28 + 21 * i);
+      samples.push(withConverted({
+        timestamp,
+        serial_number,
+        packet_number: 3 - i,
+        quat: quat(8 + 21 * i, 10 + 21 * i, 12 + 21 * i, 14 + 21 * i, timestamp, 3 - i),
+        gyro: vector3(16 + 21 * i, 18 + 21 * i, 20 + 21 * i, timestamp, 3 - i),
+        acc: vector3(22 + 21 * i, 24 + 21 * i, 26 + 21 * i, timestamp, 3 - i)
+      }));
+    }
+  } else if (header === 55 || header === 54) {
+    // header 55 (0x37): realtime gyro+acc+press (mode 3)
+    // header 54 (0x36): FIFO (lossless) data packet — identical byte layout,
+    //                   only the header byte differs. See src/InsoleFifo.js.
+    const offset = 24;
+    for (let i = 3; i >= 0; i--) {
+      const timestamp = t_start;
+      const packet_number = 3 - i;
+      samples.push(withConverted({
+        timestamp,
+        serial_number,
+        packet_number,
+        gyro: vector3(8 + offset * i, 10 + offset * i, 12 + offset * i, timestamp, packet_number),
+        acc: vector3(14 + offset * i, 16 + offset * i, 18 + offset * i, timestamp, packet_number),
+        press: {
+          values: [
+            data.getUint16(20 + offset * i),
+            data.getUint16(22 + offset * i),
+            data.getUint16(24 + offset * i),
+            data.getUint16(26 + offset * i),
+            data.getUint16(28 + offset * i),
+            data.getUint16(30 + offset * i)
+          ],
+          timestamp,
+          serial_number,
+          packet_number
+        }
+      }));
+    }
+  } else if (header === 56) {
+    const offset = 32;
+    for (let i = 1; i >= 0; i--) {
+      const timestamp = t_start;
+      const packet_number = 1 - i;
+      samples.push(withConverted({
+        timestamp,
+        serial_number,
+        packet_number,
+        quat: quat(8 + offset * i, 10 + offset * i, 12 + offset * i, 14 + offset * i, timestamp, packet_number),
+        gyro: vector3(16 + offset * i, 18 + offset * i, 20 + offset * i, timestamp, packet_number),
+        acc: vector3(22 + offset * i, 24 + offset * i, 26 + offset * i, timestamp, packet_number),
+        press: {
+          values: [
+            data.getUint16(28 + offset * i),
+            data.getUint16(30 + offset * i),
+            data.getUint16(32 + offset * i),
+            data.getUint16(34 + offset * i),
+            data.getUint16(36 + offset * i),
+            data.getUint16(38 + offset * i)
+          ],
+          timestamp,
+          serial_number,
+          packet_number
+        }
+      }));
+    }
+  } else {
+    return { header, serial_number, timestamp: t_start, samples: [] };
+  }
+
+  return { header, serial_number, timestamp: t_start, samples };
+}
+
+// insole_client e342620 の bin_to_float_pressure_n と同じ6ch既定係数。
+// 配列の順序はセンサー番号0..5、各行は4次から定数項まで。
+const DEFAULT_PRESSURE_COEFFICIENTS = [
+  [6.31278e-11, -2.33093e-7, 3.27825e-4, -1.63373e-1, 2.25012e1],
+  [6.65168e-11, -2.10741e-7, 2.31937e-4, -7.10366e-2, 6.97927],
+  [1.07646e-10, -3.85112e-7, 5.02384e-4, -2.37328e-1, 3.18015e1],
+  [5.91156e-11, -1.81045e-7, 1.86644e-4, -4.46178e-2, 3.10811],
+  [5.32573e-11, -1.68515e-7, 1.79518e-4, -4.66859e-2, 3.71484],
+  [4.44324e-11, -1.09728e-7, 8.90389e-5, 3.82816e-3, -4.46580],
+];
+
+function pressureInNewtons(x, calibration, index) {
+  const evaluate = (func, c) => func === 0
+    ? c[0] * Math.exp(c[1] * x) + c[2]
+    : (((c[0] * x + c[1]) * x + c[2]) * x + c[3]) * x + c[4];
+  let y = calibration ? evaluate(calibration.func, calibration.coeffs) : NaN;
+  if (!Number.isFinite(y)) y = evaluate(1, DEFAULT_PRESSURE_COEFFICIENTS[index]);
+  return Math.max(0, Number.isFinite(y) ? y : 0);
+}
+
+/**
+ * ORPHE INSOLE Module Javascript class
+* @class
+* @type {Object}
+* @property {string} ORPHE_INFORMATION "01a9d6b5-ff6e-444a-b266-0be75e85c064" SERVICE_UUID
+* @property {string} ORPHE_DEVICE_INFORMATION "24354f22-1c46-430e-a4ab-a1eeabbcdfc0" CHARACTERISTIC_UUID
+*
+* @property {string} ORPHE_OTHER_SERVICE "db1b7aca-cda5-4453-a49b-33a53d3f0833" SERVICE_UUID
+* @property {string} ORPHE_SENSOR_VALUES "f3f9c7ce-46ee-4205-89ac-abe64e626c0f" CHARACTERISTIC_UUID
+* @property {string} ORPHE_STEP_ANALYSIS "4eb776dc-cf99-4af7-b2d3-ad0f791a79dd" CHARACTERISTIC_UUID
+*/
+class OrpheInsole {
+  /**
+   * SENSOR_VALUES の DataView を ORPHE INSOLE のサンプル列に変換する。
+   * @param {DataView} data
+   * @param {object} options
+   * @returns {object|null}
+   */
+  static parseSensorValues(data, options = {}) {
+    return parseInsoleSensorValues(data, options);
+  }
+
+  /**
+   * リアルタイム配信モードの仕様を返す。
+   * @param {number} mode
+   * @returns {object|null}
+   */
+  static getStreamingModeInfo(mode) {
+    return ORPHE_INSOLE_STREAMING_MODES[Number(mode)] || null;
+  }
+
+  /**
+   * 初期化関数
+   * @param {number}[id=0] id コアの番号（0 or 1）を指定します。
+   */
+  constructor(id = 0) {
+
+    /** デバイスから取得した6ch校正値。未取得・非対応・失敗時はnull。 */
+    this.pressure_calibration = null;
+    this.converted_press = { values: [0, 0, 0, 0, 0, 0] };
+    this._pressureCalibrationRequest = null;
+    this.defaultGotData = this.gotData;
+    this.timestamp = new OrpheTimestamp();
+
+    Object.defineProperty(this, 'ORPHE_INFORMATION', { value: "01a9d6b5-ff6e-444a-b266-0be75e85c064", writable: true });
+    Object.defineProperty(this, 'ORPHE_DEVICE_INFORMATION', { value: "24354f22-1c46-430e-a4ab-a1eeabbcdfc0", writable: true });
+    Object.defineProperty(this, 'ORPHE_DATE_TIME', { value: "f53eeeb1-b2e8-492a-9673-10e0f1c29026", writable: true });
+    Object.defineProperty(this, 'ORPHE_OTHER_SERVICE', { value: "db1b7aca-cda5-4453-a49b-33a53d3f0833", writable: false });
+    Object.defineProperty(this, 'ORPHE_SENSOR_VALUES', { value: "f3f9c7ce-46ee-4205-89ac-abe64e626c0f", writable: false });
+    Object.defineProperty(this, 'ORPHE_STEP_ANALYSIS', { value: "4eb776dc-cf99-4af7-b2d3-ad0f791a79dd", writable: false });
+
+
+    // Initialize member variables
+    this.bluetoothDevice = null;
+    this.dataCharacteristic = null;// 最後に操作した characteristic（後方互換のために残す参照）
+    this._characteristics = {}; // uuid名 -> characteristic。read/write/notify は必ずこちらを参照する
+    this.dataChangedEventHandlerMap = {}; // イベントハンドラを保持するマップ
+    this._notifyOperationTokens = {}; // uuid ごとの notify start/stop 世代（古い非同期完了の無効化）
+    this._notifyCharacteristics = {}; // dataChangedEventHandlerMap の handler を登録した characteristic
+    this._notifyOperationQueues = {}; // 同一 characteristic の notify start/stop を呼出順に直列化
+    // 自動再接続の成功後に呼ぶ内部フック（ユーザ向け on* callback とは別系統）。
+    // SENSOR_VALUES 以外の characteristic（例: STEP_ANALYSIS/OrpheInsoleGait）を
+    // 再購読するのに使う。onReconnectSuccess を上書きせずに再購読できるようにするため。
+    this._afterReconnectSuccess = [];
+    // gotData / gotPress 等の単一コールバックを上書きせず、複数の可視化・
+    // 記録モジュールが同じRealtime packetを購読するための追加API。
+    this._sensorDataListeners = new Set();
+    this.hashUUID = {}; // UUIDを保持するハッシュ
+    this.hashUUID_lastConnected; // 最後に接続したUUIDを保持する
+    this.id = id;
+    this.array_device_information = new DataView(new ArrayBuffer(20));// device information用の配列
+
+    /**
+     * デバッグログ（console.info）の出力を有効にするフラグです。
+     * 接続トラブル調査時に true にしてください。
+     */
+    this.debug = false;
+
+    // ── 接続安定化まわりの内部状態 ───────────────────────────────
+    // デバイス記憶: 一度接続したデバイスを localStorage に記憶し、
+    // navigator.bluetooth.getDevices() (Chrome flag: Web Bluetooth New Permissions Backend)
+    // が使える環境では選択ダイアログなしで再接続できる。
+    this._lastBluetoothDeviceStorageKey = `orphe_insole_last_bluetooth_device_${id}`;
+    this._usingRememberedBluetoothDevice = false;
+    this._rememberedBluetoothDeviceUnavailable = false;
+    // 自動再接続
+    this._autoReconnectEnabled = false;
+    this._autoReconnectInProgress = false;
+    this._connecting = false; // begin() による接続処理中フラグ（connectionState 用）
+    this._autoReconnectOptions = {};
+    this._autoReconnectDevice = null;
+    this._autoReconnectDisconnectHandler = (event) => this._handleAutoReconnectDisconnect(event);
+    this._suppressAutoReconnectErrors = false;
+    this._lastAutoReconnectError = null;
+    this._serialInitialized = false;
+    // gattserverdisconnected 用 遅延バインドハンドラ。
+    // this.onDisconnect を直接 addEventListener すると、リスナー登録後に
+    // ユーザが onDisconnect を上書きしても古い関数が呼ばれ続けるため、
+    // 必ずこのラッパーを登録する。
+    this._onDisconnectHandler = (event) => {
+      this._invalidateNotifyOperations();
+      this._safeLifecycleCallback('onDisconnect', event);
+    };
+    OrpheInsole._instances = OrpheInsole._instances || [];
+    OrpheInsole._instances.push(this);
+
+    /**
+   * デバイスインフォメーションを取得して保存しておく連想配列です。begin()を呼び出すとデバイスから値を取得して初期化されます。
+   * @property {Object} device_information - デバイス情報
+   * @property {number} device_information.battery - バッテリー残量（少ない:0、普通:1、多い:2）
+   * @property {number} device_information.mount_position - コアモジュール取り付け位置（左右情報）
+  bit0 : 左右
+  bit1 : 0(足底) / 1(足背)
+  足底 : 左、右：0=(0000 0000b), 1=(0000 0001b)、
+  足背 : 左、右：2(=0000 0010b), 3(=0000 0011b)
+   * @property {Object} device_information.range - 加速度とジャイロセンサの感度設定
+   * @property {number} device_information.range.acc - 加速度レンジ（ 2, 4, 8, 16(g)：0, 1, 2, 3）
+   * @property {number} device_information.range.gyro - ジャイロレンジ（250, 500, 1000, 2000(°/s)：0, 1, 2, 3）
+  */
+    this.device_information = '';
+
+    /**
+     * 最後に受信した advertisement のステータス（gotStatus と同じ形式）。
+     * 接続後も FW バージョン等を参照できるように保持します。
+     * advertisement 監視が動作した環境（watchAdvertisements 対応ブラウザ）でのみ更新されます。
+     * @property {?Object} lastStatus - 未受信の場合は null
+     */
+    this.lastStatus = null;
+
+    /**
+     * getFirmwareVersion() が解決したファームウェアバージョン文字列のキャッシュです。
+     * @property {?string} firmware_version - 未取得の場合は null
+     */
+    this.firmware_version = null;
+
+    /**
+     * 歩容解析のデータを保存しておく連想配列です。
+     * 注意: ORPHE INSOLE のファームウェアは現状 STEP_ANALYSIS 通知に未対応のため、
+     * この値が更新されることはありません（FW対応待ち）。
+     * @property {Object} gait - 歩容解析のデータ
+     */
+    this.gait = {
+      type: 0,
+      direction: 0,
+      calorie: 0,
+      distance: 0,
+      steps: 0,
+      standing_phase_duration: 0,
+      swing_phase_duration: 0
+    }
+    /**
+     * ストライドのデータを保存しておく連想配列です。（STEP_ANALYSIS FW対応待ち）
+     */
+    this.stride = {
+      foot_angle: 0,
+      x: 0,
+      y: 0,
+      z: 0,
+      steps: 0,
+    }
+    /**
+   * プロネーションのデータを保存しておく連想配列です。（STEP_ANALYSIS FW対応待ち）
+   */
+    this.pronation = {
+      landing_impact: 0,
+      x: 0,
+      y: 0,
+      z: 0,
+      steps: 0,
+    }
+    /**
+     * 歩数カウントを保存する変数
+     */
+    this.steps_number = 0;
+
+    /**
+     * クォータニオンを保存する連想配列です。
+     * @property {Object} quat - クォータニオン
+     * @property {number} quat.w - w
+     * @property {number} quat.x - x
+     * @property {number} quat.y - y
+     * @property {number} quat.z - z
+     *
+     */
+    this.quat = {
+      w: 0.0, x: 0.0, y: 0.0, z: 0.0
+    }
+
+    /**
+     * 加速度値から2回積分で基準フレーム間の移動距離を求めた変数です
+     * @property {Object} delta - 距離
+     */
+    this.delta = {
+      x: 0.0, y: 0.0, z: 0.0
+    }
+
+    /**
+     * オイラー角を保存する連想配列です。this.quatから計算されています。
+     * @property {Object} euler - オイラー角
+     * @property {number} euler.pitch - ピッチ
+     * @property {number} euler.roll - ロール
+     * @property {number} euler.yaw - ヨー
+     */
+    this.euler = {
+      pitch: 0.0,
+      roll: 0.0,
+      yaw: 0.0
+    }
+
+    /**
+     * ジャイロセンサの値を保存する連想配列です。
+     * @property {Object} gyro - ジャイロセンサの値
+     */
+    this.gyro = {
+      x: 0.0, y: 0.0, z: 0.0
+    }
+
+    /**
+     * 加速度センサの値を保存する連想配列です。
+     * @property {Object} acc - 加速度センサの値
+     */
+    this.acc = {
+      x: 0.0, y: 0.0, z: 0.0
+    }
+
+    /**
+     * 圧力センサ（6ch）の最新値を保存する連想配列です。
+     * @property {Object} press - 圧力センサの値
+     * @property {number[]} press.values - 6チャネル分のADC生値
+     */
+    this.press = {
+      values: [0, 0, 0, 0, 0, 0]
+    }
+
+    /**
+     * ジャイロレンジに合わせて変換したジャイロセンサの値を保存する連想配列です。
+     */
+    this.converted_gyro = {
+      x: 0.0, y: 0.0, z: 0.0
+    }
+
+    /**
+     * 加速度レンジに合わせて変換した加速度センサの値を保存する連想配列です。
+     */
+    this.converted_acc = {
+      x: 0.0, y: 0.0, z: 0.0
+    }
+
+    /**
+     * データ欠損時に線形補完をするかどうかのオプション設定（beginのオプションで設定可能）。この設定は200Hz sensor_valuesのacc, gyro, quatのみに適用されます。
+     */
+    this.interpolation = {
+      enabled: false,
+      max_consecutive_missing: 1
+    }
+
+    this.history_sensor_values = {
+      acc: new FixedSizeArray(4),
+      gyro: new FixedSizeArray(4),
+      quat: new FixedSizeArray(4),
+      press: new FixedSizeArray(4), // 圧力センサの値を保持する配列
+      converted_acc: new FixedSizeArray(4),
+      converted_gyro: new FixedSizeArray(4)
+    }
+
+    this.half_round_trip_time = 0;
+
+    // Advertisement handling flags
+    this.isFirstAdvertisementReceived = false;
+
+    // メンバ変数の初期化ここまで
+    //////////////////////////
+
+  }
+
+  /**
+   * Realtime SENSOR_VALUES のデコード済みpacketを購読する。
+   * 既存の gotData / gotPress 等とは独立して呼ばれ、解除関数を返す。
+   * FIFO read mode中の要求応答packetは通知されない。
+   * @param {function} listener ({deviceId, receivedAt, packet, data}) => void
+   * @returns {function} unsubscribe
+   */
+  addSensorDataListener(listener) {
+    if (typeof listener !== 'function') {
+      throw new TypeError('OrpheInsole.addSensorDataListener expects a function');
+    }
+    this._sensorDataListeners.add(listener);
+    return () => this.removeSensorDataListener(listener);
+  }
+
+  /**
+   * addSensorDataListener() で登録した購読を解除する。
+   * @param {function} listener
+   * @returns {boolean}
+   */
+  removeSensorDataListener(listener) {
+    return this._sensorDataListeners.delete(listener);
+  }
+
+  _emitSensorData(data, packet) {
+    if (!packet || this._sensorDataListeners.size === 0) return;
+    const event = Object.freeze({
+      deviceId: this.id,
+      receivedAt: Date.now(),
+      packet,
+      data,
+    });
+    for (const listener of Array.from(this._sensorDataListeners)) {
+      try {
+        listener(event);
+      } catch (error) {
+        this._reportError(error);
+      }
+    }
+  }
+
+  _log(...args) {
+    if (this.debug) console.info('[ORPHE-INSOLE]', ...args);
+  }
+
+  /**
+   * getDeviceInformation() で取得済みのレンジ設定（index）を
+   * parseInsoleSensorValues() のフルスケール値へ変換する。
+   * 未取得・不正値のときは既定（acc 16G / gyro 2000dps）にフォールバックする。
+   * @returns {{accRange: number, gyroRange: number}}
+   */
+  _sensorParseOptions() {
+    const range = this.device_information && this.device_information.range;
+    return {
+      accRange: _orpheInsoleRangeFromSetting(_ORPHE_INSOLE_ACC_RANGES, range && range.acc, 16),
+      gyroRange: _orpheInsoleRangeFromSetting(_ORPHE_INSOLE_GYRO_RANGES, range && range.gyro, 2000)
+    };
+  }
+
+  /**
+  * gotData()がユーザ側でオーバーライドされているかどうかを返す関数です。これを見て，デバッグモード（ORPHE TERMINAL）を有効にするかどうかを判断します。オーバーライドするとgotData()以外の関数はコールバックされません．
+  *
+ */
+  isGotDataOverridden() {
+    return this.gotData !== this.defaultGotData;
+  }
+  /**
+   * UUIDを設定する関数です。UUIDはsetup()で利用するキャラクタリスティック（DEVICE_INFORMATION, SENSOR_VALUES, STEP_ANALYSIS）の指定に利用されます。
+   * @param {string} name
+   * @param {string} serviceUUID
+   * @param {string} characteristicUUID
+   *
+   */
+  setUUID(name, serviceUUID, characteristicUUID) {
+    this.hashUUID[name] = { 'serviceUUID': serviceUUID, 'characteristicUUID': characteristicUUID };
+  }
+  /**
+   * 最初に必要な初期化処理メソッドです。利用するキャラクタリスティック（DEVICE_INFORMATION, SENSOR_VALUES）の指定の他、オプションを指定することができます。通常利用では引数を省略して 今後の機能拡張を見据えたメソッドなので、基本的にはsetup()で呼び出せば良いです。
+   * @param {string[]} [string[]=["DEVICE_INFORMATION","DATE_TIME", "SENSOR_VALUES"]] DEVICE_INFORMATION, DATE_TIME, SENSOR_VALUES,
+   * @param {object} [options] - 初期化オプション
+   * @param {object} [options.interpolation] - 欠損補間オプション
+   * @param {boolean} [options.interpolation.enabled=false] - 線形補間の有効化/無効化
+   * @param {number} [options.interpolation.max_consecutive_missing=1] - 線形補間する最大の連続欠損数
+   *
+   */
+  setup(names = ['DEVICE_INFORMATION', 'DATE_TIME', 'SENSOR_VALUES'], options = {}) {
+
+    const defaultInterpolation = {
+      enabled: false,
+      max_consecutive_missing: 1
+    };
+    this.interpolation = Object.assign(
+      {},
+      defaultInterpolation,
+      (options && typeof options.interpolation === 'object' && options.interpolation) || {}
+    );
+    for (const key of ['acc', 'gyro', 'quat', 'press', 'converted_acc', 'converted_gyro']) {
+      this.history_sensor_values[key].setSize(this.interpolation.max_consecutive_missing);
+    }
+
+    for (const name of names) {
+      if (name == 'DEVICE_INFORMATION') {
+        this.setUUID(name, this.ORPHE_INFORMATION, this.ORPHE_DEVICE_INFORMATION);
+      }
+      else if (name == 'DATE_TIME') {
+        this.setUUID(name, this.ORPHE_INFORMATION, this.ORPHE_DATE_TIME);
+      }
+      else if (name == 'SENSOR_VALUES') {
+        this.setUUID(name, this.ORPHE_OTHER_SERVICE, this.ORPHE_SENSOR_VALUES);
+      }
+    }
+  }
+
+  /**
+   *  begin BLE connection
+   * SENSOR_VALUESのセンサー値の取得を開始します。
+   * @param {string} [notification_type="SENSOR_VALUES"] SENSOR_VALUES
+   * @param {object} [options]
+   * @param {number} [options.streamingMode=4] データストリーミングモード（1, 3, 4）
+   * @param {boolean} [options.autoReconnect=false] 切断時の自動再接続を有効化
+   * @param {number} [options.reconnectIntervalMs=3000] 再接続試行の間隔
+   * @param {number} [options.reconnectMaxAttempts=120] 再接続の最大試行回数
+   * @async
+   * @return {Promise<string>}
+   *
+   */
+  async begin(str_type = 'SENSOR_VALUES', options = {}) {
+    if (typeof str_type === 'object' && str_type !== null) {
+      options = str_type;
+      str_type = 'SENSOR_VALUES';
+    }
+    if (str_type == 'RAW') {
+      str_type = 'SENSOR_VALUES';
+      console.warn("RAW is deprecated. Please use SENSOR_VALUES instead.");
+    }
+    if (str_type != 'SENSOR_VALUES') {
+      console.warn(`${str_type} is not supported on ORPHE INSOLE. SENSOR_VALUES will be used instead.`);
+      str_type = 'SENSOR_VALUES';
+    }
+    const streamingMode = options.streamingMode ?? options.dataStreamingMode ?? 4;
+    const autoReconnect = options.autoReconnect ?? false;
+
+    this.notification_type = str_type;
+    if (autoReconnect) {
+      this._enableAutoReconnect(str_type, options);
+    } else if (!this._autoReconnectInProgress) {
+      this._disableAutoReconnect();
+    }
+
+    this._connecting = true;
+    try {
+      await this.getDeviceInformation(options);
+
+      // データストリーミングモードは 100Hzのジャイロ、加速度、圧力、クオータニオンに設定
+      /*
+      0x01 : リアルタイム(クォータニオン、ジャイロ、加速度)
+      0x03 : リアルタイム(ジャイロ、加速度、圧力 200Hz相当)※インソールのみ対応
+      0x04 : リアルタイム(ジャイロ、加速度、圧力、クォータニオン 100Hz相当)※インソールのみ対応
+      */
+      await this.setDataStreamingMode(streamingMode, options);
+
+      // DateTimeキャラクタリスティックを利用して時刻を同期する．現在のPC時間とデータ取得にかかる統計値からその分コアの時計を進めておく．
+      await this.syncCoreTime(3, options);
+
+      await this.startNotify('SENSOR_VALUES', options);
+      await this.getPressureCalibration();
+
+      // 接続成功: デバイスを記憶し、自動再接続用の切断検知を仕込む
+      if (this.bluetoothDevice) {
+        this._rememberBluetoothDevice(this.bluetoothDevice);
+        this._attachAutoReconnectDisconnectHandler(this.bluetoothDevice);
+      }
+      return "done begin(); SENSOR VALUES";
+    } catch (error) {
+      this._reportError(error);
+      throw error;
+    } finally {
+      this._connecting = false;
+    }
+  }
+
+  /**
+   * stop and disconnect GATT connection
+   */
+  stop() {
+    this.reset();
+  }
+
+
+  // ── エラーレポート ───────────────────────────────────────────
+  // 自動再接続の試行中は onError を逐一発火させず、最後のエラーとして保持する
+  _reportError(error) {
+    if (this._suppressAutoReconnectErrors) {
+      this._lastAutoReconnectError = error;
+      return;
+    }
+    return this.onError(error);
+  }
+
+  // 接続ライフサイクルのユーザ callback が throw しても、BLE の状態遷移や
+  // 自動再接続ループを失敗扱いにしない。onError 自体の throw も外へ伝播させない。
+  _safeLifecycleCallback(name, ...args) {
+    try {
+      if (typeof this[name] === 'function') {
+        const result = this[name](...args);
+        if (result && typeof result.catch === 'function') {
+          result.catch((error) => this._safeReportError(error, name));
+        }
+        return result;
+      }
+    } catch (error) {
+      this._safeReportError(error, name);
+    }
+    return undefined;
+  }
+
+  _safeReportError(error, source = 'lifecycle') {
+    try {
+      // ライフサイクル callback/hook の失敗は transport error ではないため、
+      // 自動再接続中でも _lastAutoReconnectError へ混ぜず onError へ直接報告する。
+      const result = typeof this.onError === 'function' ? this.onError(error) : undefined;
+      if (result && typeof result.catch === 'function') {
+        result.catch((reportError) => {
+          try { console.error(`OrpheInsole.${source} callback failed:`, reportError); } catch { /* noop */ }
+        });
+      }
+    } catch (reportError) {
+      try { console.error(`OrpheInsole.${source} callback failed:`, reportError); } catch { /* noop */ }
+    }
+  }
+
+  _nextNotifyOperation(uuid) {
+    const next = (this._notifyOperationTokens[uuid] || 0) + 1;
+    this._notifyOperationTokens[uuid] = next;
+    return next;
+  }
+
+  // startNotifications/stopNotifications は完了順が逆転すると、JS 側の handler と
+  // characteristic の実状態が食い違う。同じ characteristic に対する副作用だけを
+  // 直列化し、再接続で characteristic が変わった場合は旧 GATT を待たない。
+  _enqueueNotifyOperation(uuid, characteristic, operationToken, operation) {
+    const previousEntry = this._notifyOperationQueues[uuid];
+    const previous = previousEntry && previousEntry.characteristic === characteristic
+      ? previousEntry.tail
+      : Promise.resolve();
+    const result = previous
+      .catch(() => { /* 前の呼出しの失敗で次の操作を止めない */ })
+      .then(() => {
+        if (this._notifyOperationTokens[uuid] !== operationToken) return undefined;
+        return operation();
+      });
+    // queue の tail は常に fulfilled にして、呼出し側へ返す result の reject だけを維持する。
+    const entry = { characteristic, tail: result.catch(() => { /* sequencing only */ }) };
+    this._notifyOperationQueues[uuid] = entry;
+    entry.tail.then(() => {
+      if (this._notifyOperationQueues[uuid] === entry) delete this._notifyOperationQueues[uuid];
+    });
+    return result;
+  }
+
+  // GATT切断/clear後に古い startNotifications Promise が解決しても、
+  // 新接続の handler map を上書きしないよう全notify操作を無効化する。
+  _invalidateNotifyOperations() {
+    this._clearPressureCalibration();
+    const uuids = new Set([
+      ...Object.keys(this._notifyOperationTokens),
+      ...Object.keys(this.dataChangedEventHandlerMap),
+      ...Object.keys(this._notifyCharacteristics),
+    ]);
+    for (const uuid of uuids) {
+      this._notifyOperationTokens[uuid] = (this._notifyOperationTokens[uuid] || 0) + 1;
+      const handler = this.dataChangedEventHandlerMap[uuid];
+      const characteristic = this._notifyCharacteristics[uuid];
+      if (handler && characteristic) {
+        try { characteristic.removeEventListener('characteristicvaluechanged', handler); } catch { /* noop */ }
+      }
+      delete this.dataChangedEventHandlerMap[uuid];
+      delete this._notifyCharacteristics[uuid];
+    }
+    // 新しい GATT 世代は旧 characteristic の未完了操作を待たない。
+    // 旧 queue の identity-check cleanup が新しい辞書を消すことはない。
+    this._notifyOperationQueues = {};
+    // Gait の補償 stop も旧 GATT 世代の処理なので、再接続後の start を塞がない。
+    if (this._gaitNotifyCleanupPromises) {
+      this._gaitNotifyCleanupPromises.clear();
+      delete this._gaitNotifyCleanupPromises;
+    }
+    if (this._gaitNotifyPendingSubscriptions) {
+      this._gaitNotifyPendingSubscriptions.clear();
+      delete this._gaitNotifyPendingSubscriptions;
+    }
+  }
+
+  // ── 自動再接続 ──────────────────────────────────────────────
+  _enableAutoReconnect(str_type, options = {}) {
+    this._autoReconnectEnabled = true;
+    const reconnectOptions = Object.assign({}, options);
+    delete reconnectOptions.forceDeviceSelection;
+    this._autoReconnectOptions = Object.assign(reconnectOptions, { autoReconnect: true });
+  }
+
+  _disableAutoReconnect() {
+    this._autoReconnectEnabled = false;
+    this._autoReconnectInProgress = false;
+    this._suppressAutoReconnectErrors = false;
+  }
+
+  _autoReconnectIntervalMs() {
+    const interval = Number(this._autoReconnectOptions.reconnectIntervalMs);
+    return Number.isFinite(interval) && interval >= 0 ? interval : 3000;
+  }
+
+  _autoReconnectMaxAttempts() {
+    const attempts = Number(this._autoReconnectOptions.reconnectMaxAttempts);
+    return Number.isFinite(attempts) && attempts > 0 ? attempts : 120;
+  }
+
+  _autoReconnectWait(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  _attachAutoReconnectDisconnectHandler(device) {
+    if (!device?.addEventListener) return;
+    if (this._autoReconnectDevice === device) return;
+    if (this._autoReconnectDevice?.removeEventListener) {
+      try {
+        this._autoReconnectDevice.removeEventListener('gattserverdisconnected', this._autoReconnectDisconnectHandler);
+      } catch (_) { }
+    }
+    this._autoReconnectDevice = device;
+    device.addEventListener('gattserverdisconnected', this._autoReconnectDisconnectHandler);
+  }
+
+  async _restoreAutoReconnectDevice() {
+    if (this.bluetoothDevice) return true;
+    const rememberedDevice = await this._requestRememberedBluetoothDevice();
+    if (!rememberedDevice) return false;
+    this.bluetoothDevice = rememberedDevice;
+    this._usingRememberedBluetoothDevice = true;
+    this.bluetoothDevice.addEventListener('gattserverdisconnected', this._onDisconnectHandler);
+    this._attachAutoReconnectDisconnectHandler(this.bluetoothDevice);
+    this.onScan(this.bluetoothDevice.name);
+    return true;
+  }
+
+  _handleAutoReconnectDisconnect() {
+    if (!this._autoReconnectEnabled || this._autoReconnectInProgress) return;
+    this._startAutoReconnect();
+  }
+
+  async _startAutoReconnect() {
+    if (!this._autoReconnectEnabled || this._autoReconnectInProgress) return;
+
+    this._autoReconnectInProgress = true;
+    const startedAt = Date.now();
+    const maxAttempts = this._autoReconnectMaxAttempts();
+    const intervalMs = this._autoReconnectIntervalMs();
+    let lastError = null;
+
+    for (let attempt = 1; this._autoReconnectEnabled && attempt <= maxAttempts; attempt++) {
+      this._safeLifecycleCallback('onReconnectAttempt', { attempt, maxAttempts, intervalMs });
+
+      try {
+        const hasDevice = await this._restoreAutoReconnectDevice();
+        if (!hasDevice) throw new Error('Last connected Bluetooth device not found. Please reconnect manually.');
+
+        this._lastAutoReconnectError = null;
+        this._suppressAutoReconnectErrors = true;
+        const result = await this.begin(this.notification_type, this._autoReconnectOptions);
+        this._suppressAutoReconnectErrors = false;
+
+        if (result) {
+          this._autoReconnectInProgress = false;
+          const info = {
+            attempt,
+            maxAttempts,
+            elapsedMs: Date.now() - startedAt,
+            result,
+          };
+          // SENSOR_VALUES 以外の characteristic を再購読する内部フック（例: OrpheInsoleGait）。
+          // 公開 callback が throw して内部復旧を妨げないよう、内部フックを先に起動する。
+          for (const hook of this._afterReconnectSuccess.slice()) {
+            try {
+              const hookResult = hook();
+              if (hookResult && typeof hookResult.catch === 'function') {
+                hookResult.catch((hookError) => this._safeReportError(hookError, 'reconnectHook'));
+              }
+            } catch (hookError) {
+              this._safeReportError(hookError, 'reconnectHook');
+            }
+          }
+          this._safeLifecycleCallback('onReconnectSuccess', info);
+          return;
+        }
+
+        lastError = this._lastAutoReconnectError || new Error('Auto reconnect attempt failed.');
+      } catch (error) {
+        this._suppressAutoReconnectErrors = false;
+        lastError = error;
+      }
+
+      if (!this._autoReconnectEnabled || attempt >= maxAttempts) break;
+      await this._autoReconnectWait(intervalMs);
+    }
+
+    this._autoReconnectInProgress = false;
+    const error = lastError || new Error('Auto reconnect failed.');
+    this._safeLifecycleCallback('onReconnectFailed', { maxAttempts, elapsedMs: Date.now() - startedAt, error });
+    this._safeReportError(error, 'autoReconnect');
+  }
+
+  // ── デバイス記憶（選択ダイアログなしの再接続） ─────────────────
+  /**
+   * 前回デバイスの記憶を使わず、必ずブラウザのBLE選択ダイアログを表示する。
+   * 接続済みINSOLEから別INSOLEへ手動で切り替える場合に利用する。
+   * @param {string} uuid
+   */
+  selectBluetoothDevice(uuid = 'DEVICE_INFORMATION') {
+    this._disableAutoReconnect();
+    this._invalidateNotifyOperations();
+    this.forgetLastBluetoothDevice();
+    if (this.bluetoothDevice?.gatt?.connected) {
+      try { this.bluetoothDevice.gatt.disconnect(); } catch (_) { }
+    }
+    this.bluetoothDevice = null;
+    this.dataCharacteristic = null;
+    this._characteristics = {};
+    this._usingRememberedBluetoothDevice = false;
+    this._rememberedBluetoothDeviceUnavailable = false;
+    return this.requestDevice(uuid);
+  }
+
+  /**
+   * 最後に接続成功した Bluetooth デバイス情報を忘れる。
+   * 次回 begin() 時に手動選択ダイアログから別デバイスへ切り替えたい場合に利用する。
+   */
+  forgetLastBluetoothDevice() {
+    this._rememberedBluetoothDeviceUnavailable = false;
+    try { localStorage.removeItem(this._lastBluetoothDeviceStorageKey); } catch (_) { }
+  }
+
+  _rememberBluetoothDevice(device) {
+    if (!device) return;
+    this._rememberedBluetoothDeviceUnavailable = false;
+    try {
+      localStorage.setItem(this._lastBluetoothDeviceStorageKey, JSON.stringify({
+        deviceId: this.id,
+        bluetoothId: device.id || '',
+        bluetoothName: device.name || '',
+        lastConnectedAt: Date.now(),
+      }));
+    } catch (_) { }
+  }
+
+  _getLastBluetoothDeviceInfo() {
+    try {
+      const raw = localStorage.getItem(this._lastBluetoothDeviceStorageKey);
+      if (!raw) return null;
+      const info = JSON.parse(raw);
+      if (!info || (!info.bluetoothId && !info.bluetoothName)) return null;
+      return info;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _findLastBluetoothDevice(devices) {
+    const info = this._getLastBluetoothDeviceInfo();
+    return this._findBluetoothDevice(devices, info);
+  }
+
+  _findBluetoothDevice(devices, info) {
+    if (!info || !Array.isArray(devices)) return null;
+    const bluetoothId = info.bluetoothId || info.id || '';
+    const bluetoothName = info.bluetoothName || info.name || '';
+
+    if (bluetoothId) {
+      const matchedById = devices.find(device => device.id === bluetoothId);
+      if (matchedById) return matchedById;
+    }
+
+    if (bluetoothName) {
+      const matchedByName = devices.filter(device => device.name === bluetoothName);
+      if (matchedByName.length === 1) return matchedByName[0];
+    }
+
+    return null;
+  }
+
+  _findBluetoothDeviceInUse(device) {
+    if (!device || !Array.isArray(OrpheInsole._instances)) return null;
+    return OrpheInsole._instances.find(instance => {
+      if (!instance || instance === this || instance.id === this.id) return false;
+      const assignedDevice = instance.bluetoothDevice;
+      if (!assignedDevice) return false;
+      if (assignedDevice === device) return true;
+      if (assignedDevice.id && device.id && assignedDevice.id === device.id) return true;
+      return false;
+    }) || null;
+  }
+
+  async _requestRememberedBluetoothDevice() {
+    if (!navigator.bluetooth?.getDevices) return null;
+    try {
+      const devices = await navigator.bluetooth.getDevices();
+      return this._findLastBluetoothDevice(devices);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * Reset Analysis logs in the core module.
+   */
+  resetAnalysisLogs() {
+    const data = new Uint8Array([0x04]);
+    this.write('DEVICE_INFORMATION', data);
+  }
+  scan(uuid, options = {}) {
+    this._log('scan()', {
+      uuid,
+      hasBluetoothDevice: !!this.bluetoothDevice,
+      hasNavigatorBluetooth: typeof navigator !== 'undefined' && !!navigator.bluetooth,
+      options
+    });
+    if (this.bluetoothDevice) return Promise.resolve();
+
+    const useRememberedDevice = !options.forceDeviceSelection &&
+      !this._rememberedBluetoothDeviceUnavailable &&
+      this._getLastBluetoothDeviceInfo();
+    return (useRememberedDevice ? this._requestRememberedBluetoothDevice() : Promise.resolve(null))
+      .then(device => {
+        if (!device) return this.requestDevice(uuid);
+        const inUseBy = this._findBluetoothDeviceInUse(device);
+        if (inUseBy) {
+          this._rememberedBluetoothDeviceUnavailable = true;
+          this.forgetLastBluetoothDevice();
+          if (this._autoReconnectInProgress) {
+            throw new Error(`Bluetooth device "${device.name || device.id || 'unknown'}" is already assigned to ORPHE INSOLE ${String(inUseBy.id + 1).padStart(2, '0')}. Select a different device.`);
+          }
+          return this.requestDevice(uuid);
+        }
+        this.bluetoothDevice = device;
+        this._usingRememberedBluetoothDevice = true;
+        this.bluetoothDevice.addEventListener('gattserverdisconnected', this._onDisconnectHandler);
+        this.onScan(this.bluetoothDevice.name);
+      })
+      .catch(error => {
+        this._reportError(error);
+        throw error;
+      });
+  }
+  /**
+   * Execute requestDevice()
+   * @param {string} uuid
+   *
+   */
+  requestDevice(uuid) {
+    let options = {
+      /*
+      ORPHE insole module name: INS
+      一部のINSOLE firmwareはadvertisementにservice UUIDを載せないため、
+      chooserではINSのnamePrefixで候補を絞り、optionalServicesで接続後に必要なserviceへアクセスします。
+      */
+      filters: [
+        { namePrefix: 'INS' }
+      ],
+      acceptAllDevices: false,
+      optionalServices: [
+        this.ORPHE_INFORMATION,
+        this.ORPHE_OTHER_SERVICE,
+        // 標準BLE Device Information Service (0x180A)。
+        // FWが実装している場合に getFirmwareVersion() が Firmware Revision を読む。
+        'device_information'
+      ],
+      optionalManufacturerData: [
+        0x0000
+      ]
+    };
+
+    this._log('requestDevice() before navigator.bluetooth.requestDevice', {
+      uuid,
+      options,
+      hasNavigatorBluetooth: typeof navigator !== 'undefined' && !!navigator.bluetooth,
+      isSecureContext: typeof window !== 'undefined' ? window.isSecureContext : undefined,
+      href: typeof window !== 'undefined' ? window.location.href : undefined
+    });
+    return navigator.bluetooth.requestDevice(options)
+      .then(device => {
+        const inUseBy = this._findBluetoothDeviceInUse(device);
+        if (inUseBy) {
+          throw new Error(`Bluetooth device "${device.name || device.id || 'unknown'}" is already assigned to ORPHE INSOLE ${String(inUseBy.id + 1).padStart(2, '0')}. Select a different device.`);
+        }
+        this.bluetoothDevice = device;
+        // デバイスが変わった可能性があるため、デバイス固有のキャッシュを破棄する
+        this.lastStatus = null;
+        this.firmware_version = null;
+        this._usingRememberedBluetoothDevice = false;
+        this._rememberedBluetoothDeviceUnavailable = false;
+        this.bluetoothDevice.addEventListener('gattserverdisconnected', this._onDisconnectHandler);
+        this._log('requestDevice() selected device', {
+          uuid,
+          deviceName: this.bluetoothDevice.name,
+          deviceId: this.bluetoothDevice.id
+        });
+        this.onScan(this.bluetoothDevice.name);
+
+        // await this.autoStartWatchingAdvertisements();
+      });
+  }
+
+  /**
+   * アドバタイズメント監視を自動開始（機能が利用可能な場合のみ）
+   */
+  async autoStartWatchingAdvertisements() {
+    // 機能が利用可能かチェック
+    if (!this.bluetoothDevice) {
+      return;
+    }
+
+    // watchAdvertisementsがサポートされているかチェック
+    if (!navigator.bluetooth || !BluetoothDevice.prototype.watchAdvertisements) {
+      console.log('Advertisement monitoring not available - Chrome experimental features may be disabled');
+      return;
+    }
+
+    if (!this.bluetoothDevice.watchAdvertisements) {
+      console.warn('watchAdvertisements is not supported on this device/browser');
+      return;
+    }
+
+    // アドバタイズメント監視を自動開始
+    await this.startWatchingAdvertisements();
+  }
+
+  /**
+   * アドバタイズメントデータの監視を開始
+   */
+  startWatchingAdvertisements() {
+    if (!this.bluetoothDevice) {
+      console.error('Bluetooth device not available');
+      return;
+    }
+
+    // watchAdvertisementsがサポートされているかチェック
+    if (!this.bluetoothDevice.watchAdvertisements) {
+      console.warn('watchAdvertisements is not supported on this device/browser');
+      return;
+    }
+
+    // アドバタイズメントイベントリスナーを追加
+    this.bluetoothDevice.addEventListener('advertisementreceived', (event) => {
+      this.onAdvertisementReceived(event);
+    });
+
+    // アドバタイズメント監視を開始
+    this.bluetoothDevice.watchAdvertisements()
+      .then(() => {
+        console.log('Started watching advertisements for', this.bluetoothDevice.name);
+      })
+      .catch(error => {
+        console.error('Error starting advertisement watch:', error);
+      });
+  }
+
+  /**
+   * アドバタイズメントデータ受信時のコールバック
+   * @param {BluetoothAdvertisingEvent} event
+   */
+  onAdvertisementReceived(event) {
+    this._log('Advertisement Received', {
+      name: event.device.name,
+      rssi: event.rssi,
+      txPower: event.txPower
+    });
+
+    const dv = event.manufacturerData ? event.manufacturerData.get(0x0000) : null;
+    // version(bytes 15-17) まで含まない短い manufacturer data は無視する
+    if (!dv || dv.byteLength < 18) return;
+
+    const status = {
+      name: event.device.name,
+      rssi: event.rssi,
+      txPower: event.txPower,
+      id: event.device.id,
+      battery: dv.getUint8(14),
+      model_type: dv.getUint8(5),
+      mounting_position: dv.getUint8(6),
+      human_activity_recognition: dv.getUint8(7),
+      version: `${dv.getUint8(15)}.${dv.getUint8(16)}.${dv.getUint8(17)}`
+    }
+    // 接続後も参照できるよう常に保持する（gotStatus 未設定でも更新される）
+    this.lastStatus = status;
+
+    // カスタムコールバックがあれば呼び出し
+    if (this.gotStatus) {
+      this.gotStatus(status);
+    }
+  }
+
+  /**
+   * アドバタイズメント監視を停止
+   */
+  stopWatchingAdvertisements() {
+    if (this.bluetoothDevice) {
+      this.bluetoothDevice.removeEventListener('advertisementreceived', this.onAdvertisementReceived);
+      console.log('Stopped watching advertisements');
+    }
+  }
+
+  /**
+   * GATT通信を始めるための関数。read, write, startNotify, stopNotifyが呼び出されるとscanと一緒に呼び出されます。
+   * @param {string} uuid
+   *
+   */
+  connectGATT(uuid, options = {}) {
+    this._log('connectGATT() start', {
+      uuid,
+      hasBluetoothDevice: !!this.bluetoothDevice,
+      gattConnected: !!(this.bluetoothDevice && this.bluetoothDevice.gatt && this.bluetoothDevice.gatt.connected),
+      hasCachedCharacteristic: !!this._characteristics[uuid],
+      lastConnected: this.hashUUID_lastConnected
+    });
+    if (!this.bluetoothDevice) {
+      var error = _insoleError('NO_DEVICE', "No Bluetooth Device");
+      this._reportError(error);
+      return Promise.reject(error);
+    }
+    // UUID ごとにキャッシュした characteristic があればそのまま使う。
+    if (this.bluetoothDevice.gatt.connected && this._characteristics[uuid]) {
+      this.hashUUID_lastConnected = uuid; // 後方互換のため代入は残す
+      this.dataCharacteristic = this._characteristics[uuid];
+      return Promise.resolve();
+    }
+    // GATT リンクが切れている場合、旧接続の characteristic はすべて無効。
+    // ここで破棄しないと、物理切断→自動再接続後に別 UUID の操作が
+    // stale なキャッシュにヒットして失敗し続ける（実機で確認された再接続バグ）。
+    if (!this.bluetoothDevice.gatt.connected) {
+      this._characteristics = {};
+    }
+    this.hashUUID_lastConnected = uuid;
+
+    // connectTimeoutMs（opt-in・既定なし）: gatt.connect() のハング対策
+    let connectPromise = this.bluetoothDevice.gatt.connect();
+    const timeoutMs = Number(options.connectTimeoutMs);
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      let timeoutTimer;
+      connectPromise = Promise.race([
+        connectPromise.finally(() => clearTimeout(timeoutTimer)),
+        new Promise((_, reject) => {
+          timeoutTimer = setTimeout(() => {
+            try { this.bluetoothDevice?.gatt?.disconnect(); } catch (cleanupError) { void cleanupError; /* タイムアウト後の切断失敗は無視 */ }
+            reject(_insoleError('CONNECT_TIMEOUT', `GATT connect timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
+        })
+      ]);
+    }
+
+    return connectPromise
+      .then(server => {
+        return server.getPrimaryService(this.hashUUID[uuid].serviceUUID);
+      })
+      .then(service => {
+        return service.getCharacteristic(this.hashUUID[uuid].characteristicUUID);
+      })
+      .then(characteristic => {
+        // UUID 別に保持する。dataCharacteristic は「最後に触った characteristic」
+        // として後方互換のために残すが、内部の read/write/notify は
+        // this._characteristics[uuid] のみを参照する。
+        this._characteristics[uuid] = characteristic;
+        this.dataCharacteristic = characteristic;
+        this.onConnectGATT(uuid);
+        this.onConnect(uuid);
+
+        // アドバタイズメント監視を自動開始（機能が利用可能な場合のみ）
+        // this.autoStartWatchingAdvertisements();
+      })
+      .catch(error => {
+        this._reportError(error);
+        // 記憶していたデバイスが見つからない/権限切れの場合は記憶経由の接続を
+        // 一旦諦め、次回 scan() でユーザに選択ダイアログを出す
+        if (this._usingRememberedBluetoothDevice) {
+          this._rememberedBluetoothDeviceUnavailable = true;
+          this._usingRememberedBluetoothDevice = false;
+          this.bluetoothDevice = null;
+          this.dataCharacteristic = null;
+          this._characteristics = {};
+        }
+        throw error;
+      });
+  }
+  /**
+   * uuid 名に対応する characteristic を返す（内部用）。
+   * 通常は connectGATT() が UUID 別に保持したものを返す。
+   * 後方互換のため、キャッシュ未登録時は dataCharacteristic にフォールバックする
+   * （dataCharacteristic を直接注入している既存コード・テストを壊さない）。
+   * @param {string} uuid
+   * @returns {BluetoothRemoteGATTCharacteristic}
+   */
+  _characteristicFor(uuid) {
+    return this._characteristics[uuid] || this.dataCharacteristic;
+  }
+  /**
+   * サーバからのデータを受信したときに呼び出される関数です。この関数は、characteristicvaluechangedイベントが発生したときに呼び出されます。
+   * @param {function} self
+   * @param {string} uuid
+   *
+   */
+  dataChanged(self, uuid) {
+    return function (event) {
+      self.onRead(event.target.value, uuid);
+    }
+  }
+  /**
+   * サーバからデータを読み込む。notificationからはonReadで呼び出されるので、この関数を利用するのは DEVICE_INFORMATION characteristicのみです。
+   * @param {string} uuid DEVICE_INFORMATION
+   *
+   */
+  read(uuid, options = {}) {
+    return (this.scan(uuid, options))
+      .then(() => {
+        return this.connectGATT(uuid, options);
+      })
+      .then(() => {
+        return this._characteristicFor(uuid).readValue();
+      })
+      .catch(error => {
+        this._reportError(error);
+        throw error; // エラーを再スローして、呼び出し側でキャッチできるようにする
+      });
+  }
+  /**
+   * write data to the BLE device。実際にwriteを利用するのは DEVICE_INFORMATION characteristicのみです。
+   * @param {string} uuid DEVICE_INFORMATION, SENSOR_VALUES, STEP_ANALYSIS
+   * @param {dataView} array_value write bytes
+   *
+   */
+  write(uuid, array_value, options = {}) {
+    return (this.scan(uuid, options))
+      .then(() => {
+        return this.connectGATT(uuid, options);
+      })
+      .then(() => {
+        const data = Uint8Array.from(array_value);
+        return this._characteristicFor(uuid).writeValue(data);
+      })
+      .then(() => {
+        this.onWrite(uuid);
+      })
+      .catch(error => {
+        this._reportError(error);
+        throw error;
+      });
+  }
+  /**
+   * Start Notification
+   * @param {string} uuid
+   *
+   */
+  startNotify(uuid, options = {}) {
+    const operationToken = this._nextNotifyOperation(uuid);
+    return this.scan(uuid, options)
+      .then(() => {
+        // scan 待機中に新しい start/stop または切断が発生した旧操作は、
+        // 新しい接続へ進まずここで終了する。
+        if (this._notifyOperationTokens[uuid] !== operationToken) return undefined;
+        return this.connectGATT(uuid, options);
+      })
+      .then(() => {
+        // connectGATT 待機中に世代が変わった旧操作が、新 GATT の characteristic を
+        // 取得して startNotifications() しないよう、取得前に再度確認する。
+        if (this._notifyOperationTokens[uuid] !== operationToken) return undefined;
+        const characteristic = this._characteristicFor(uuid);
+        return this._enqueueNotifyOperation(uuid, characteristic, operationToken, async () => {
+          await characteristic.startNotifications();
+          // 待機中により新しい操作が予約された場合、その操作が同じ queue の後ろで
+          // 最終状態を確定するため、この古い handler は登録しない。
+          if (this._notifyOperationTokens[uuid] !== operationToken) return;
+          const handler = this.dataChanged(this, uuid);
+          const previousHandler = this.dataChangedEventHandlerMap[uuid];
+          const previousCharacteristic = this._notifyCharacteristics[uuid];
+          if (previousHandler && previousCharacteristic) {
+            try { previousCharacteristic.removeEventListener('characteristicvaluechanged', previousHandler); } catch { /* noop */ }
+          }
+          this.dataChangedEventHandlerMap[uuid] = handler;
+          this._notifyCharacteristics[uuid] = characteristic;
+          characteristic.addEventListener('characteristicvaluechanged', handler);
+          this.onStartNotify(uuid);
+        });
+      })
+      .catch(error => {
+        console.error('startNotify: Error : ' + error);
+        this._reportError(error);
+        throw error;
+      });
+  }
+  /**
+   * Stop Notification
+   * @param {string} uuid
+   *
+   */
+  stopNotify(uuid, options = {}) {
+    const operationToken = this._nextNotifyOperation(uuid);
+    return this.scan(uuid, options) // BLEデバイスのスキャンを開始します。
+      .then(() => {
+        if (this._notifyOperationTokens[uuid] !== operationToken) return undefined;
+        return this.connectGATT(uuid, options); // GATTサーバーに接続します。
+      })
+      .then(() => {
+        if (this._notifyOperationTokens[uuid] !== operationToken) return undefined;
+        const characteristic = this._characteristicFor(uuid);
+        return this._enqueueNotifyOperation(uuid, characteristic, operationToken, async () => {
+          // handler は queue 内で取得する。先行 startNotify が待機中なら、その完了後に
+          // 登録された handler をこの stop が確実に解除するため。
+          const handler = this.dataChangedEventHandlerMap[uuid];
+          const handlerCharacteristic = this._notifyCharacteristics[uuid] || characteristic;
+          await characteristic.stopNotifications();
+          if (handler && handlerCharacteristic) {
+            try { handlerCharacteristic.removeEventListener('characteristicvaluechanged', handler); } catch { /* noop */ }
+          }
+          if (this.dataChangedEventHandlerMap[uuid] === handler) delete this.dataChangedEventHandlerMap[uuid];
+          if (this._notifyCharacteristics[uuid] === handlerCharacteristic) delete this._notifyCharacteristics[uuid];
+          if (this._notifyOperationTokens[uuid] === operationToken) this.onStopNotify(uuid);
+        });
+      })
+      .catch(error => {
+        this._reportError(error);
+      });
+
+  }
+  isConnected() {
+    if (!this.bluetoothDevice) {
+      return false;
+    }
+    return this.bluetoothDevice.gatt.connected;
+  }
+
+  /**
+   * 接続状態を返す（UI 表示用）。
+   * - 'connected'    : GATT 接続中
+   * - 'reconnecting' : 自動再接続の試行中
+   * - 'connecting'   : begin() による接続処理中
+   * - 'disconnected' : 上記以外
+   * @returns {'disconnected'|'connecting'|'connected'|'reconnecting'}
+   */
+  get connectionState() {
+    if (this.isConnected()) return 'connected';
+    if (this._autoReconnectInProgress) return 'reconnecting';
+    if (this._connecting) return 'connecting';
+    return 'disconnected';
+  }
+
+  /**
+   * BLEデバイスとの接続を切断します。デバイス接続をマニュアルで切断する場合には reset() を利用してください。切断だけでなくクラス内のメンバ変数もクリア初期化する必要があり、reset()を利用するとそれらの処理が行われます。
+   *
+   */
+  disconnect() {
+    if (!this.bluetoothDevice) {
+      var error = _insoleError('NO_DEVICE', "No Bluetooth Device");
+      this._reportError(error);
+      return;
+    }
+
+    // アドバタイズメント監視を停止
+    this.stopWatchingAdvertisements();
+
+    if (this.bluetoothDevice.gatt.connected) {
+      this._invalidateNotifyOperations();
+      this.bluetoothDevice.gatt.disconnect();
+      // 切断後の再接続では characteristic を取り直す
+      this._characteristics = {};
+    } else {
+      var error = _insoleError('ALREADY_DISCONNECTED', "Bluetooth Device is already disconnected");
+      this._reportError(error);
+      return;
+    }
+  }
+  /**
+   * this.device_informationの連想配列形式でデータを渡すことで、コアモジュールのデバイス設定ができます。
+   * 注意: ORPHE INSOLE の現行ファームウェアでは未対応です。
+   * @param {object} obj
+   */
+  setDeviceInformation(obj) {
+    // この機能は insole では未対応とします。
+    // const senddata = new Uint8Array([0x01, obj.lr, obj.led_brightness, 0, obj.rec_auto_run, obj.time01, obj.time02, obj.range.acc, obj.range.gyro]);
+    // this.write('DEVICE_INFORMATION', senddata);
+    const error = new Error('setDeviceInformation is not supported on ORPHE INSOLE.');
+    console.warn(error.message);
+    this._reportError(error);
+  }
+
+  /**
+   * Sets the data streaming mode for the device.
+   *
+   * @param {number} mode - The streaming mode to set. Should be a valid mode value recognized by the device.
+   * @returns {Promise<void>}
+   */
+  async setDataStreamingMode(mode = 4, options = {}) {
+    const normalizedMode = Number(mode);
+    const supportedModes = [1, 3, 4];
+    if (!Number.isInteger(normalizedMode) || !supportedModes.includes(normalizedMode)) {
+      throw _insoleError('INVALID_MODE', `Invalid ORPHE INSOLE data streaming mode: ${mode}. Use 1, 3, or 4.`);
+    }
+    const data = new Uint8Array([0x0D, normalizedMode]);
+    await this.write('DEVICE_INFORMATION', data, options);
+    this.streaming_mode = normalizedMode;
+  }
+
+
+  /**
+   * COREモジュールの時刻を PCの時刻 + random_trip_time/2 で同期します。
+   *
+   * @param {number}[n=3] n - 平均値算出のためのサンプル数
+   * @return {object} {sum_round_trip_time, average_round_trip_time, standard_time, adjusted_time, round_trip_times}
+   */
+  async syncCoreTime(n = 3, options = {}) {
+    if (typeof n === 'object' && n !== null) {
+      options = n;
+      n = 3;
+    }
+    let average_round_trip_time = 0;
+    let sum_round_trip_time = 0;
+    let core_time;
+    let round_trip_times = [];
+    for (let i = 0; i < n; i++) {
+      core_time = await this.getDateTime(options);
+      sum_round_trip_time += core_time.round_trip_time;
+      round_trip_times.push(core_time.round_trip_time);
+    }
+    average_round_trip_time = sum_round_trip_time / n;
+    const now = new Date();
+    const standard_time = now.getTime();
+    const adjusted_time = parseInt(standard_time + Math.round(average_round_trip_time / 2));
+    core_time.date.setTime(adjusted_time);
+
+    await this.setDateTime(core_time.date, options);
+    this.half_round_trip_time = Math.round(average_round_trip_time / 2);
+    return { sum_round_trip_time, average_round_trip_time, standard_time, adjusted_time, round_trip_times };
+
+  }
+  /**
+   * [YY, MM, DD, hh, mm, ss, (sub)ss]の配列を渡すことで、コアモジュールの日時設定ができます。
+   */
+  async setDateTime(set_date, options = {}) {
+    const array = new Uint8Array(7);
+    array[0] = set_date.getFullYear() - 2000;
+    array[1] = set_date.getMonth() + 1;
+    array[2] = set_date.getDate();
+    array[3] = set_date.getHours();
+    array[4] = set_date.getMinutes();
+    array[5] = set_date.getSeconds();
+    array[6] = parseInt(set_date.getMilliseconds() / 10);
+    const senddata = new Uint8Array([array[0], array[1], array[2], array[3], array[4], array[5], array[6]]);
+    await this.write('DATE_TIME', senddata, options);
+  }
+
+  /**
+   * 接続情報をクリアします。
+   */
+  clear() {
+    this._invalidateNotifyOperations();
+    this.bluetoothDevice = null;
+    this.dataCharacteristic = null;
+    this._characteristics = {};
+    this._serialInitialized = false;
+    this.isFirstAdvertisementReceived = false; // フラグをリセット
+    this.onClear();
+  }
+  /**
+   * reset(disconnect & clear)
+   * マニュアル切断の意思表示とみなし、自動再接続も無効化します。
+   */
+  reset() {
+    this._disableAutoReconnect();
+    this.disconnect(); //disconnect() is not Promise Object
+    this.clear();
+    this.onReset();
+  }
+
+  _checkSerialGap(current) {
+    if (!this._serialInitialized) {
+      this._serialInitialized = true;
+      this.serial_number = current;
+      return;
+    }
+    const prev = this.serial_number;
+    this.serial_number = current;
+    const diff = (current - prev + 65536) % 65536;
+    if (diff !== 1) this.lostData(current, prev);
+  }
+
+
+
+
+
+  // Readコールバック
+  /**
+   * Incoming byte callback function. コアモジュールから送信されるデータを受信するコールバック関数です。それぞれのUUIDに対応するデータを正しく整形して対応するコールバック関数に渡します。ユーザはコールバック関数を手元のコードでオーバーライドして利用します。gotData()がユーザによってオーバーライドされている場合は、gotData以外のnotifyに伴うコールバック関数はすべて呼び出されないことに注意してください。
+   * @param {dataView} data incoming bytes
+   * @param {string} uuid
+   */
+  onRead(data, uuid) {
+    if (uuid === 'SENSOR_VALUES' && data.byteLength > 0 && data.getUint8(0) === 0x39) {
+      if (this.isGotDataOverridden()) this.gotData(data, uuid);
+      return;
+    }
+    // FIFO (lossless) collection intercepts SENSOR_VALUES notifications here so
+    // its request/response protocol can consume command replies and data packets
+    // directly, bypassing the realtime got* dispatch. See src/InsoleFifo.js.
+    if (uuid === 'SENSOR_VALUES' && typeof this._fifoNotifySink === 'function') {
+      this._fifoNotifySink(data);
+      return;
+    }
+
+    // 歩容解析(STEP_ANALYSIS characteristic)の notify は OrpheInsoleGait のデコーダが
+    // 直接消費する（got* のリアルタイムディスパッチはバイパス）。See src/InsoleGait.js.
+    if (uuid === 'STEP_ANALYSIS' && typeof this._gaitNotifySink === 'function') {
+      this._gaitNotifySink(data);
+      return;
+    }
+
+    let ret = this.timestamp.getHz();
+    if (ret > 0) this.gotBLEFrequency(ret);
+
+    // Realtime packet listener は既存 gotData / got* のどちらを利用するアプリとも
+    // 共存する。購読者がいる時だけ先にdecodeし、同じpacketを各購読者へ配る。
+    let parsedSensorPacket = null;
+    if (uuid === 'SENSOR_VALUES' && this._sensorDataListeners.size > 0) {
+      parsedSensorPacket = parseInsoleSensorValues(data, this._sensorParseOptions());
+      if (parsedSensorPacket && [50, 55, 56].includes(parsedSensorPacket.header)) {
+        this._emitSensorData(data, parsedSensorPacket);
+      }
+    }
+
+    // 生データモニタリングの場合はそのままデータをgotDataで渡して、returnする（データ欠損以外の他の処理は行わない）
+    if (this.isGotDataOverridden() == true) {
+      this.gotData(data, uuid);
+      // データ欠損チェック
+      if (uuid == 'SENSOR_VALUES') {
+        // 50,55,56がリアルタームデータ取得時の先頭ヘッダ
+        if (data.getUint8(0) == 50 || data.getUint8(0) == 55 || data.getUint8(0) == 56) {
+          this._checkSerialGap(data.getUint16(1));
+        }
+      }
+      return;
+    }
+
+    // デバイス情報Readの場合
+    if (uuid == 'DEVICE_INFORMATION') {
+    }
+    else if (uuid == 'SENSOR_VALUES') {
+      const parsed = parsedSensorPacket || parseInsoleSensorValues(data, this._sensorParseOptions());
+      if (!parsed) {
+        console.warn("SENSOR VALUES: Data length is not 104");
+        return;
+      }
+
+      // データ欠損チェック
+      this._checkSerialGap(parsed.serial_number);
+
+      for (const sample of parsed.samples) {
+        if (sample.quat) {
+          this.quat = sample.quat;
+          this.history_sensor_values.quat.push(this.quat);
+        }
+        if (sample.gyro) {
+          this.gyro = sample.gyro;
+          this.history_sensor_values.gyro.push(this.gyro);
+        }
+        if (sample.acc) {
+          this.acc = sample.acc;
+          this.history_sensor_values.acc.push(this.acc);
+        }
+        if (sample.press) {
+          this.press = sample.press;
+          this.converted_press = {
+            ...sample.press,
+            values: sample.press.values.map((x, i) => pressureInNewtons(x, this.pressure_calibration?.[i], i))
+          };
+          this.history_sensor_values.press.push(this.press);
+        }
+        if (sample.converted_gyro) {
+          this.converted_gyro = sample.converted_gyro;
+          this.history_sensor_values.converted_gyro.push(this.converted_gyro);
+        }
+        if (sample.converted_acc) {
+          this.converted_acc = sample.converted_acc;
+          this.history_sensor_values.converted_acc.push(this.converted_acc);
+        }
+
+        if (sample.quat && typeof Quaternion !== 'undefined') {
+          // Normalize defensively before Euler conversion so scale drift or
+          // quantization error cannot compress the reported angles.
+          const normalizedQuat = _orpheInsoleNormalizeQuaternion(this.quat);
+          let q = new Quaternion(normalizedQuat.w, normalizedQuat.x, normalizedQuat.y, normalizedQuat.z);
+          this.euler = q.toEuler();
+        }
+
+        if (parsed.header == 50) {
+          this.gotAcc(this.acc);
+          this.gotQuat(this.quat);
+          this.gotGyro(this.gyro);
+          this.gotConvertedAcc(this.converted_acc);
+          this.gotConvertedGyro(this.converted_gyro);
+          if (sample.quat && typeof Quaternion !== 'undefined') this.gotEuler(this.euler);
+        }
+        else if (parsed.header == 55) {
+          this.gotAcc(this.acc);
+          this.gotGyro(this.gyro);
+          this.gotConvertedAcc(this.converted_acc);
+          this.gotConvertedGyro(this.converted_gyro);
+          this.gotPress(this.press);
+          this.gotConvertedPress(this.converted_press);
+        }
+        else if (parsed.header == 56) {
+          this.gotQuat(this.quat);
+          if (sample.quat && typeof Quaternion !== 'undefined') this.gotEuler(this.euler);
+          this.gotAcc(this.acc);
+          this.gotGyro(this.gyro);
+          this.gotConvertedAcc(this.converted_acc);
+          this.gotConvertedGyro(this.converted_gyro);
+          this.gotPress(this.press);
+          this.gotConvertedPress(this.converted_press);
+        }
+      }
+
+    }
+  }
+
+  /**
+   * Date Timeを取得する
+   * 0	year	0-255	西暦から2000を引いた数
+   * 1	month
+   * 2	day
+   * 3	hour
+   * 4	minute
+   * 5	second
+   * 6	subsecond
+   *
+   * @returns {Promise<object>} date_timeを連想配列形式{timestamp, data,round_trip_time}で返す。dataにはCOREから直接送信されてきたdataviewが格納されている。round_trip_timeはデータを取得にかかった時間[ms]。
+   */
+  async getDateTime(options = {}) {
+    return new Promise((resolve, reject) => {
+      const startTime = performance.now(); // 関数開始時の時間を取得
+      this.read('DATE_TIME', options).then((data) => {
+        const endTime = performance.now(); // データの取得が完了したので，時間を記録
+        const date = new Date(
+          data.getUint8(0) + 2000,
+          data.getUint8(1),
+          data.getUint8(2),
+          data.getUint8(3),
+          data.getUint8(4),
+          data.getUint8(5),
+          data.getUint8(6) * 10 // 10ms単位で送られてくる
+        );
+        const elapsedTime = endTime - startTime; // 経過時間を計算
+        this.date_time = {
+          date: date,
+          raw: data,
+          round_trip_time: Math.floor(elapsedTime)
+        };
+        resolve(this.date_time);
+      }).catch(error => {  // ダイアログのキャンセルはそのまま閉じる
+        const message = error && error.message ? error.message : String(error);
+        if (error && error.name === 'NotFoundError') {
+          this._log('requestDevice chooser cancelled', { message });
+        } else {
+          console.log('Error: ' + error);
+        }
+        this._reportError(error);
+        reject(error);
+      });
+    });
+  }
+
+  /**
+   * 接続中のデバイスから圧力校正値を取得し、6ch分を一括保持します。
+   * begin()後に使用してください。通知が未開始の場合もnullを返します。
+   * 非対応・不正応答・通信失敗・タイムアウトはnull（onErrorは発火しません）。
+   * @param {{timeoutMs?: number}} [options] 取得全体の期限。既定2000ms。
+   * @returns {Promise<Array<{sensor_index: number, func: number, coeffs: number[]}>|null>}
+   */
+  getPressureCalibration(options = {}) {
+    if (this._pressureCalibrationRequest) return this._pressureCalibrationRequest.promise;
+    this.pressure_calibration = null;
+    const device = this.bluetoothDevice;
+    const sensor = this._notifyCharacteristics.SENSOR_VALUES;
+    const info = this._characteristics.DEVICE_INFORMATION;
+    if (!device?.gatt?.connected || !sensor || !info) return Promise.resolve(null);
+
+    const requestedTimeout = Number(options?.timeoutMs);
+    const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0 ? requestedTimeout : 2000;
+    const request = { active: true, expected: -1, rows: [], accept: null };
+    let resolveResult;
+    request.promise = new Promise(resolve => { resolveResult = resolve; });
+    const handler = event => {
+      const data = event.target.value;
+      if (!request.active || this.bluetoothDevice !== device || !device.gatt.connected ||
+          !data.byteLength || data.getUint8(0) !== 0x39) return;
+      if (data.byteLength < 43) { request.finish(null); return; }
+      const index = data.getUint8(1);
+      const func = data.getUint8(2);
+      const coeffs = Array.from({ length: 5 }, (_, i) => data.getFloat64(3 + i * 8, false));
+      if (index > 5 || (func !== 0 && func !== 1) || !coeffs.every(Number.isFinite)) {
+        request.finish(null);
+        return;
+      }
+      // 完了したchの重複・順序外通知は採用しない。
+      if (index !== request.expected || !request.accept) return;
+      request.rows[index] = { sensor_index: index, func, coeffs };
+      const accept = request.accept;
+      request.accept = null;
+      accept();
+    };
+    request.finish = result => {
+      if (!request.active) return;
+      request.active = false;
+      clearTimeout(request.timer);
+      try { sensor.removeEventListener('characteristicvaluechanged', handler); } catch { /* 切断済みでも終了する */ }
+      if (this._pressureCalibrationRequest === request) {
+        this.pressure_calibration = result;
+        this._pressureCalibrationRequest = null;
+      }
+      // 応答待機中の内部タスクも終了させる。
+      if (request.accept) request.accept();
+      request.accept = null;
+      resolveResult(result);
+    };
+    this._pressureCalibrationRequest = request;
+    request.timer = setTimeout(() => request.finish(null), timeoutMs);
+    // public read/write経由のonErrorやデバイス選択を発生させない専用経路。
+    Promise.resolve().then(async () => {
+      if (!request.active) return;
+      sensor.addEventListener('characteristicvaluechanged', handler);
+      for (let index = 0; index < 6 && request.active; index++) {
+        request.expected = index;
+        const response = new Promise(resolve => { request.accept = resolve; });
+        await info.writeValue(Uint8Array.of(0x10, 0x00, index));
+        if (!request.active) return;
+        await response;
+      }
+      if (request.active) request.finish(request.rows);
+    }).catch(() => request.finish(null));
+    return request.promise;
+  }
+
+  _clearPressureCalibration() {
+    this._pressureCalibrationRequest?.finish(null);
+    this.pressure_calibration = null;
+  }
+
+  /** 校正式で換算した6chの荷重[N]を通知します。 */
+  gotConvertedPress(press) {
+  }
+
+  /**
+   * 呼び出すと現在のデバイス設定を取得します。連想配列形式でリターンされます。asyncに対応させているので、awaitを利用して呼び出すことをおすすめします。
+   * @returns {Promise<object>} device_informationを連想配列形式で返す
+   */
+  async getDeviceInformation(options = {}) {
+    return new Promise((resolve, reject) => {
+      this.read('DEVICE_INFORMATION', options).then((data) => {
+        if (!data) {
+          const error = new Error('No data received from DEVICE_INFORMATION');
+          console.error('Error: ' + error.message);
+          this._reportError(error);
+          reject(error);
+          return;
+        }
+
+        this.device_information = {
+          battery: data.getUint8(0),
+          mount_position: data.getUint8(1),
+          range: {
+            acc: data.getUint8(8),
+            gyro: data.getUint8(9)
+          },
+          raw: data
+        }
+        resolve(this.device_information);
+      }).catch(error => {  // ダイアログのキャンセルはそのまま閉じる
+        const message = error && error.message ? error.message : String(error);
+        if (error && error.name === 'NotFoundError') {
+          this._log('requestDevice chooser cancelled', { message });
+        } else {
+          console.log('Error: ' + error);
+        }
+        this._reportError(error);
+        reject(error);
+      });
+    });
+  }
+
+  /**
+   * ファームウェアバージョン文字列を取得します。例外は投げず、取得できない場合は null を返します。
+   *
+   * 解決順:
+   * 1. 標準BLE Device Information Service (0x180A) の Firmware / Software Revision String
+   *    （FWが実装している場合。接続済みであることが必要）
+   * 2. advertisement 由来の {@link OrpheInsole#lastStatus} の version
+   *    （watchAdvertisements が動作した環境で接続前に受信していた場合）
+   *
+   * 現行の一部FW（例: 1.0.1 個体）は 0x180A を実装していないため、
+   * ブラウザが advertisement 監視に対応していない環境では null になることがあります。
+   * 結果は {@link OrpheInsole#firmware_version} にキャッシュされます。
+   * @returns {Promise<?string>} 例: "1.0.1"。取得できない場合は null
+   */
+  async getFirmwareVersion() {
+    if (this.firmware_version) return this.firmware_version;
+    const fromDis = await this._readFirmwareRevisionString();
+    const version = fromDis || (this.lastStatus && this.lastStatus.version) || null;
+    if (version) this.firmware_version = version;
+    return version;
+  }
+
+  /**
+   * 標準BLE DIS(0x180A) から Firmware / Software Revision String を読む（内部用）。
+   * サービス未実装・権限なし・未接続の場合は null（例外は投げない）。
+   * @returns {Promise<?string>}
+   */
+  async _readFirmwareRevisionString() {
+    try {
+      if (!this.bluetoothDevice || !this.bluetoothDevice.gatt || !this.bluetoothDevice.gatt.connected) {
+        return null;
+      }
+      const service = await this.bluetoothDevice.gatt.getPrimaryService('device_information');
+      for (const characteristicName of ['firmware_revision_string', 'software_revision_string']) {
+        try {
+          const characteristic = await service.getCharacteristic(characteristicName);
+          const data = await characteristic.readValue();
+          const text = new TextDecoder().decode(data).replace(/\0+$/, '').trim();
+          if (text) return text;
+        } catch (error) {
+          this._log('firmware revision characteristic unavailable', {
+            characteristicName,
+            message: error && error.message ? error.message : String(error)
+          });
+        }
+      }
+      return null;
+    } catch (error) {
+      // 0x180A 未実装のFW・過去のgrant（optionalServices追加前）ではここに来る
+      this._log('device_information service (0x180A) unavailable', {
+        message: error && error.message ? error.message : String(error)
+      });
+      return null;
+    }
+  }
+
+
+  //--------------------------------------------------
+  //一般開発ユーザからアクセス可能な関数のプロトタイプ定義
+  /**
+   * ORPHE TERMINAL用に作成した関数。onReadで受け取ったデータをそのまま渡す。このメソッドがユーザ側でオーバーライドされると、その他のnotifyに伴うコールバック関数（gotAcc等）はすべて呼び出されなくなるので注意してください。dataview形式なので、取り扱い方法については ORPHE TERMINALのソースを参照するとよい。
+   * @param {dataview} data onReadで取得したすべてのデータ
+   */
+  gotData(data) { }
+
+
+  /**
+   * Handles the received status.
+   * @param {Object} status - The status object containing device advertisement information.
+   * @param {string} status.name - デバイス名
+   * @param {number} status.rssi - 受信信号強度 (dBm)
+   * @param {number} status.txPower - 送信出力 (dBm)
+   * @param {string} status.id - デバイスID
+   * @param {number} status.battery - バッテリー残量
+   * @param {number} status.model_type - モデルタイプ
+   * @param {number} status.mounting_position - 取り付け位置
+   * @param {number} status.human_activity_recognition - 人間活動認識
+   * @param {string} status.version - ファームウェアバージョン (例: "1.2.3")
+   */
+  gotStatus(status) {
+  }
+  /**
+   * コアモジュールの圧力情報を取得する。
+   * values[i] は公式センサ番号 i+1 に対応する（1 つま先内側, 2 母趾球内側, 3 つま先外側,
+   * 4 中足部中央, 5 中足部外側, 6 踵）。配置図: https://orphe-oss.github.io/ORPHE-INSOLE.js/demo-app/#coords
+   * @param {Object} press {values[],timestamp,packet_number} 圧力の取得
+   */
+  gotPress(press) { }
+
+  /**
+   * コアモジュールのクオータニオン情報を取得する
+   * @param {Object} quat {w,x,y,z} クオータニオンの取得
+   */
+  gotQuat(quat) { }
+  /**
+   * ジャイロ（x,y,zの角速度）を取得する
+   * @param {Object} gyro {x,y,z} ジャイロの取得
+   */
+  gotGyro(gyro) { }
+  /**
+   * 加速度を取得する。加速度レンジに応じて変換された値がほしい場合は、gotConvertedAccを利用すること
+   * 対応CharacteristicはSENSOR_VALUES
+   * @param {Object} acc {x,y,z} 加速度の取得
+   */
+  gotAcc(acc) { }
+  /**
+   * ジャイロレンジに応じた物理値[deg/s]を取得する。
+   * raw int16 にレンジ別のセンサー感度（±250/500/1000/2000 dps で
+   * 8.75/17.5/35/70 mdps/LSB）を掛けた値であり、正規化値（gotGyro）に
+   * レンジを掛けた値とは一致しない。
+   * @param {Object} gyro {x,y,z} ジャイロの物理値[deg/s]
+   */
+  gotConvertedGyro(gyro) { }
+  /**
+   * コアモジュールで設定されている加速度レンジに応じて変換された値を取得する。
+   * 座標系は右手系（Z-up）: Y=つま先方向, X=つま先方向に向かって右, Z=上（静止時 z≈+1G）。
+   * @param {Object} acc {x,y,z} 加速度レンジに応じて変換した加速度の取得
+   */
+  gotConvertedAcc(acc) { }
+  /**
+   * 加速度値を2回積分して各x,y,zの単位時間の移動距離を取得する。
+   * @param {Object} delta {x,y,z} x,y,zの前回フレームからの移動距離
+   */
+  gotDelta(delta) { }
+  /**
+   * コアモジュールのオイラー角を取得する。オイラー角の取得は破綻する可能性があるため、姿勢を取る場合はクオータニオンを利用すること
+   * @param {Object} euler {pitch, roll, yaw} オイラー角
+   */
+  gotEuler(euler) { }
+  /**
+   * 歩容解析の取得（STEP_ANALYSIS FW対応待ちのため現状呼び出されません）
+   * @param {Object} gait {type, direction, calorie, distance} 歩行解析の取得
+   */
+  gotGait(gait) { }
+  /**
+   * 現在の歩容タイプを取得する（STEP_ANALYSIS FW対応待ち）
+   * @param {Object} type {value} 0:none, 1:walk, 2:run, 3:stand
+   */
+  gotType(type) { }
+  /**
+   * ランニングの方向を取得する（STEP_ANALYSIS FW対応待ち）
+   * @param {Object} direction {value} 0:none, 1:foward, 2:backward, 3:inside, 4:outside
+   */
+  gotDirection(direction) { }
+  /**
+   * 総消費カロリーを取得する（STEP_ANALYSIS FW対応待ち）
+   * @param {Object} calorie {value}
+   */
+  gotCalorie(calorie) { }
+
+  /**
+   * 総移動距離を取得する（STEP_ANALYSIS FW対応待ち）
+   * @param {Object} distance {value}
+   */
+  gotDistance(distance) { }
+
+  /**
+   * 立脚期継続時間[s]を取得する（STEP_ANALYSIS FW対応待ち）
+   * @param {*} standing_phase_duration
+   */
+  gotStandingPhaseDuration(standing_phase_duration) { }
+
+  /**
+   * 遊脚期継続時間[s]を取得する（STEP_ANALYSIS FW対応待ち）
+   * @param {*} swing_phase_duration
+   */
+  gotSwingPhaseDuration(swing_phase_duration) { }
+  /**
+   * ストライド[m]の取得（STEP_ANALYSIS FW対応待ち）
+   * @param {Object} stride {x,y,z}
+   */
+  gotStride(stride) { }
+  /**
+   * 着地角度[degree]の取得（STEP_ANALYSIS FW対応待ち）
+   * @param {Object} foot_angle {value}
+   */
+  gotFootAngle(foot_angle) { }
+
+  /**
+   * プロネーション[degree]の取得（STEP_ANALYSIS FW対応待ち）
+   * @param {Object} pronation {x,y,z}
+   */
+  gotPronation(pronation) { }
+  /**
+   * 着地衝撃力[kgf/weight]の取得（STEP_ANALYSIS FW対応待ち）
+   * @param {Object} landing_impact {value}
+   */
+  gotLandingImpact(landing_impact) { }
+  /**
+   * 現在までの歩数を取得する（STEP_ANALYSIS FW対応待ち）
+   * @param {Object} steps_number {value}
+   */
+  gotStepsNumber(steps_number) { }
+
+  /**
+   * 以前来たデータとのシリアルナンバーの差が1でない場合に呼び出される。SENSOR_VALUESのcharacteristicを利用したリアルタイムデータ取得時に利用可能。
+   * @param {number} serial_number - 現在のシリアルナンバー
+   * @param {number} serial_number_prev - 一つ前に受診したデータのシリアルナンバー
+   */
+  lostData(serial_number, serial_number_prev) { }
+
+  // 既定の進行ログは debug 時のみ出力する（v1.2.0 での挙動変更）。
+  // 従来どおり常時ログを出したい場合は insole.debug = true にするか、各コールバックを上書きする。
+  onScan(deviceName) { if (this.debug) console.log("onScan"); }
+  onConnectGATT(uuid) { if (this.debug) console.log("onConnectGATT"); }
+  onConnect(uuid) { if (this.debug) console.log("onConnect"); }
+  onWrite(uuid) { if (this.debug) console.log("onWrite"); }
+  onStartNotify(uuid) { if (this.debug) console.log("onStartNotify", uuid); }
+  onStopNotify(uuid) { if (this.debug) console.log("onStopNotify", uuid); }
+  onDisconnect() { if (this.debug) console.log("onDisconnect"); }
+
+  /**
+   * 自動再接続の試行開始時に呼び出される
+   * @param {Object} info {attempt, maxAttempts, intervalMs}
+   */
+  onReconnectAttempt(info) { }
+  /**
+   * 自動再接続成功時に呼び出される
+   * @param {Object} info {attempt, maxAttempts, elapsedMs, result}
+   */
+  onReconnectSuccess(info) { }
+  /**
+   * 自動再接続が最大試行回数に達して失敗したときに呼び出される
+   * @param {Object} info {maxAttempts, elapsedMs, error}
+   */
+  onReconnectFailed(info) { }
+
+  /**
+   * アドバタイズメントデータを受信した時に呼び出される
+   * @param {BluetoothAdvertisingEvent} event - アドバタイズメントイベント
+   */
+  onAdvertisement(event) { if (this.debug) console.log("onAdvertisement", event); }
+
+  /**
+   * notification frequencyの実測値を取得する
+   * @param {float} frequency
+   */
+  gotBLEFrequency(frequency) { }
+  onClear() { if (this.debug) console.log("onClear"); }
+  onReset() { if (this.debug) console.log("onReset"); }
+  // エラーは debug に関係なく常時出力する（console.error に格上げ）
+  onError(error) { console.error("onError: ", error); }
+
+  //一般開発ユーザからアクセス可能な関数の定義ここまで
+  //--------------------------------------------------
+}
+
+OrpheInsole.STREAMING_MODES = ORPHE_INSOLE_STREAMING_MODES;
+// package.json の version と同じ値を保つ（tests/insole-version-sync.test.js が検証）。
+// 記録データに SDK 版を残す用途（例: gait-report の CSV）で、デコード規則の差異を後から追えるようにする。
+OrpheInsole.SDK_VERSION = '1.3.4';
+
+// ── グローバル公開とエイリアス ─────────────────────────────────
+// 推奨クラス名は OrpheInsole。
+// 後方互換のため、同一ページに ORPHE-CORE.js が読み込まれていない場合に限り
+// `Orphe` というエイリアスも公開する（CORE と同時読み込み時は CORE 側の
+// `Orphe` が優先され、INSOLE は OrpheInsole で利用する）。
+if (typeof global.OrpheInsole === 'undefined') {
+  global.OrpheInsole = OrpheInsole;
+}
+let hasLexicalOrphe = false;
+try {
+  // CORE.js が先に読み込まれている場合、class Orphe のレキシカル束縛が見える
+  hasLexicalOrphe = (typeof Orphe !== 'undefined');
+} catch (_) {
+  hasLexicalOrphe = true;
+}
+if (!hasLexicalOrphe && typeof global.Orphe === 'undefined') {
+  global.Orphe = OrpheInsole;
+}
+// 補助クラス/関数も衝突しない形で公開（既存コードの直接利用との互換のため）
+if (typeof global.FixedSizeArray === 'undefined') global.FixedSizeArray = FixedSizeArray;
+if (typeof global.OrpheTimestamp === 'undefined') global.OrpheTimestamp = OrpheTimestamp;
+if (typeof global.parseInsoleSensorValues === 'undefined') global.parseInsoleSensorValues = parseInsoleSensorValues;
+if (typeof global.ORPHE_INSOLE_STREAMING_MODES === 'undefined') {
+  global.ORPHE_INSOLE_STREAMING_MODES = ORPHE_INSOLE_STREAMING_MODES;
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    Orphe: OrpheInsole,
+    OrpheInsole,
+    FixedSizeArray,
+    OrpheTimestamp,
+    parseInsoleSensorValues,
+    ORPHE_INSOLE_STREAMING_MODES
+  };
+}
+
+})(typeof globalThis !== 'undefined' ? globalThis : this);
