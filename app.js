@@ -864,7 +864,61 @@
       : t("noData");
   }
 
+  // ---- 代償運動とのつながり（連続記録版の追加）
+  // 測っているのは①（着地の足の倒れ方）だけ。②〜⑦は社内の連動の考え方
+  // （距骨→アーチ→すね→膝→骨盤→腰→肋骨。3D解剖ビューアと同じ並び）による理屈での見立て。
+  const CHAIN = ["距骨が内へ倒れる", "内側アーチが落ちる", "すねが内へねじれる",
+    "膝が内に入る", "骨盤が前に倒れる", "腰が反る", "肋骨が開く"];
+  const CHAIN_MIN_STEPS = 20;
+  function pronationMix(rows) {
+    const c = { inward: 0, middle: 0, outward: 0 };
+    for (const r of rows) {
+      const t = r.pronation_type;
+      if (t === "over" || t === "severeOver") c.inward++;
+      else if (t === "neutral") c.middle++;
+      else if (t === "under" || t === "severeUnder") c.outward++;
+    }
+    const n = c.inward + c.middle + c.outward;
+    const pct = (k) => (n ? Math.round(c[k] / n * 100) : 0);
+    let lean = "middle";
+    if (n && c.inward >= c.middle && c.inward >= c.outward) lean = "inward";
+    else if (n && c.outward > c.middle && c.outward > c.inward) lean = "outward";
+    return { n, lean, inward: pct("inward"), middle: pct("middle"), outward: pct("outward") };
+  }
+  function renderChain() {
+    const box = root.document.getElementById("chain-panel");
+    if (!box) return;
+    const sideName = { left: "左足", right: "右足" };
+    const cols = SIDES.map((side) => {
+      const m = pronationMix(state.rows[side]);
+      let head, items;
+      if (m.n < CHAIN_MIN_STEPS) {
+        head = `<p class="chain-mix">記録が${m.n}歩のため、まだ見立てません（${CHAIN_MIN_STEPS}歩から）。</p>`;
+        items = CHAIN.map((t, i) => `<li><span class="chain-tag none">—</span>${i + 1}. ${t}</li>`);
+      } else {
+        head = `<p class="chain-mix">着地の足の倒れ方（${m.n}歩）：内へ ${m.inward}%／真ん中 ${m.middle}%／外へ ${m.outward}%</p>`;
+        items = CHAIN.map((t, i) => {
+          if (i === 0) {
+            const word = m.lean === "inward" ? "内へ倒れる歩きが多い" : m.lean === "outward" ? "外へ倒れる歩きが多い" : "真ん中が多い";
+            return `<li><span class="chain-tag measured">インソールで測った</span>1. ${t} → ${word}</li>`;
+          }
+          if (m.lean === "inward") return `<li><span class="chain-tag inferred">理屈での見立て</span>${i + 1}. ${t}（起きやすい）</li>`;
+          if (m.lean === "middle") return `<li><span class="chain-tag none">見立てなし</span>${i + 1}. ${t}</li>`;
+          return `<li><span class="chain-tag none">当てはまらない</span>${i + 1}. ${t}</li>`;
+        });
+        if (m.lean === "middle") head += '<p class="chain-mix">足元が真ん中なので、足元から始まる崩れの流れは見えにくい歩きです。</p>';
+        if (m.lean === "outward") head += '<p class="chain-mix">内へ倒れる流れとは逆の、外側に乗る歩きです。この7段階の見立ては当てはまりません。</p>';
+      }
+      return `<div class="chain-col"><h3>${sideName[side]}</h3>${head}<ol>${items.join("")}</ol></div>`;
+    });
+    box.innerHTML = '<h2>代償運動とのつながり</h2>'
+      + '<p class="chain-lead">インソールで測れるのは①の足元だけです。②〜⑦は、足元から膝・骨盤・腰・肋骨へ順に伝わる連動の考え方で見立てたものです（測った値ではありません）。</p>'
+      + `<div class="chain-cols">${cols.join("")}</div>`
+      + '<p class="chain-note">足の倒れ方の「内へ／真ん中／外へ」は ORPHE の基準（平均 −9.4°±3.5°）で分けています。良し悪しの判定ではありません。</p>';
+  }
+
   function renderReport() {
+    renderChain();
     const report = Stats.buildReport(state.rows, TARGET);
     renderReportHead(report);
     renderStatGrid(report);

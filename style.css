@@ -1037,3 +1037,22 @@ footer {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ---- 代償運動とのつながり（連続記録版の追加） ---- */
+.chain-panel{margin:24px 0;padding:20px;border:1px solid #d8dee8;border-radius:16px;background:#fff;color:#1f2937}
+.chain-panel h2{font-size:1.25rem;margin:0 0 6px}
+.chain-panel .chain-lead{font-size:.9rem;color:#5b6575;margin:0 0 14px}
+.chain-cols{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media (max-width:640px){.chain-cols{grid-template-columns:1fr}}
+.chain-col{border:1px solid #e5e9f0;border-radius:12px;padding:12px}
+.chain-col h3{font-size:1rem;margin:0 0 8px}
+.chain-col .chain-mix{font-size:.85rem;color:#5b6575;margin:0 0 8px}
+.chain-col ol{list-style:none;margin:0;padding:0}
+.chain-col li{display:flex;gap:8px;align-items:flex-start;padding:6px 0;border-top:1px dashed #e5e9f0;font-size:.92rem}
+.chain-col li:first-child{border-top:0}
+.chain-tag{flex:0 0 auto;font-size:.72rem;font-weight:700;border-radius:999px;padding:2px 8px;white-space:nowrap}
+.chain-tag.measured{background:#dcfce7;color:#166534}
+.chain-tag.inferred{background:#fef3c7;color:#92400e}
+.chain-tag.none{background:#eef1f5;color:#6b7280}
+.chain-note{font-size:.82rem;color:#6b7280;margin:12px 0 0}
+@media (prefers-color-scheme:dark){.chain-panel{background:#111827;color:#e5e7eb;border-color:#374151}.chain-col{border-color:#374151}.chain-col li{border-color:#374151}}
