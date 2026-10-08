@@ -1043,7 +1043,8 @@ footer {
 .chain-panel h2{font-size:1.25rem;margin:0 0 6px}
 .chain-panel .chain-lead{font-size:.9rem;color:#5b6575;margin:0 0 14px}
 .chain-cols{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-@media (max-width:640px){.chain-cols{grid-template-columns:1fr}}
+/* 左右は横に並べたまま（施主 10/9「左右が分かれていて見づらい」） */
+@media (max-width:640px){.chain-col{padding:8px}.chain-col li{font-size:.8rem;flex-direction:column;gap:2px}.chain-col .chain-mix{font-size:.78rem}}
 .chain-col{border:1px solid #e5e9f0;border-radius:12px;padding:12px}
 .chain-col h3{font-size:1rem;margin:0 0 8px}
 .chain-col .chain-mix{font-size:.85rem;color:#5b6575;margin:0 0 8px}
@@ -1056,3 +1057,13 @@ footer {
 .chain-tag.none{background:#eef1f5;color:#6b7280}
 .chain-note{font-size:.82rem;color:#6b7280;margin:12px 0 0}
 @media (prefers-color-scheme:dark){.chain-panel{background:#111827;color:#e5e7eb;border-color:#374151}.chain-col{border-color:#374151}.chain-col li{border-color:#374151}}
+
+/* ---- 足裏のいま（左右を横並び） ---- */
+.sole-pair{display:flex;justify-content:center;gap:6%;}
+.sole-foot{width:min(40%,180px);text-align:center}
+.sole-foot svg{width:100%;height:auto;display:block}
+.sole-outline{fill:#f3f4f6;stroke:#9ca3af;stroke-width:2}
+.sole-dot{fill:#f97316;fill-opacity:.08;transition:fill-opacity .08s,r .08s}
+.sole-cop{fill:#fff;stroke:#111827;stroke-width:2}
+.sole-label{font-weight:700;margin-top:4px}
+@media (prefers-color-scheme:dark){.sole-outline{fill:#1f2937;stroke:#4b5563}}

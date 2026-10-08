@@ -869,6 +869,7 @@
   // ---- 足裏の流れ（かかと→小指→親指）。圧力6点の生データを1歩ずつ数える（flow.js）
   const Flow = root.FootFlow || null;
   const flowAnalyzers = [null, null];
+  let soleView = null;   // 足裏のいま（sole.js）。init で作る
   function emptyFlow() { const c = {}; if (Flow) for (const k of Flow.ORDER) c[k] = 0; return c; }
   function resetFlow() {
     state.flow = { left: emptyFlow(), right: emptyFlow() };
@@ -884,8 +885,10 @@
       const samples = ev && ev.packet && ev.packet.samples;
       if (!Array.isArray(samples)) return;
       const an = flowAnalyzers[deviceId];
+      let lastPress = null;
       for (const s of samples) {
         if (!s || !s.press || !s.press.values) continue;
+        lastPress = s.press.values;
         const t = Number.isFinite(s.timestamp) ? s.timestamp : ev.receivedAt;
         const kind = an.push(s.press.values, t);
         if (kind && state.recording && state.sessionSource !== "demo") {
@@ -894,6 +897,7 @@
           if (!flowRenderTimer) flowRenderTimer = root.setTimeout(() => { flowRenderTimer = null; renderFlow(); }, 500);
         }
       }
+      if (lastPress && soleView) soleView.update(state.deviceSides[deviceId], lastPress);
     });
   }
   function renderFlow() {
@@ -1009,6 +1013,7 @@
     root.addEventListener("gait-report:languagechange", refreshLanguage);
 
     for (const deviceId of DEVICE_IDS) installDevice(deviceId);
+    if (root.SoleView) soleView = root.SoleView.create(root.document.getElementById("sole-panel"));
     root.setInterval(() => { for (const id of DEVICE_IDS) attachFlow(id); }, 1000);
     updateConnectionSource();
     renderAll();
