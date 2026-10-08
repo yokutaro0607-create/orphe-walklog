@@ -313,11 +313,26 @@
       firmwareVersions: DEVICE_IDS.map(deviceFirmwareVersion),
       sdkVersion: root.OrpheInsole && root.OrpheInsole.SDK_VERSION ? root.OrpheInsole.SDK_VERSION : null
     });
+    const filename = Stats.csvFilename(state.startedAt || Date.now());
+    // iPhone（Bluefy など）はリンクでの保存が効かないので、共有メニューで渡す。
+    // 共有も使えなければ、CSVの文字を画面に出してコピーできるようにする。
+    const nav = root.navigator || {};
+    const isIOS = /iPhone|iPad|iPod/.test(nav.userAgent || "")
+      || (nav.platform === "MacIntel" && nav.maxTouchPoints > 1);
+    let file = null;
+    try { file = new root.File([csv], filename, { type: "text/csv" }); } catch (e) { file = null; }
+    if (file && nav.canShare && nav.canShare({ files: [file] })) {
+      nav.share({ files: [file], title: filename })
+        .then(() => { state.saved = true; })
+        .catch((e) => { if (!e || e.name !== "AbortError") showCsvText(csv, filename); });
+      return;
+    }
+    if (isIOS) { showCsvText(csv, filename); return; }
     const blob = new root.Blob([csv], { type: "text/csv" });
     const url = root.URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = Stats.csvFilename(state.startedAt || Date.now());
+    anchor.download = filename;
     state.saved = true;
     anchor.style.display = "none";
     document.body.appendChild(anchor);
@@ -326,6 +341,45 @@
       root.URL.revokeObjectURL(url);
       if (anchor.parentNode) anchor.parentNode.removeChild(anchor);
     }, 1000);
+  }
+
+  // 保存できない端末向け：CSVを画面に出して「コピー」「共有」で持ち出す
+  function showCsvText(csv, filename) {
+    const old = document.getElementById("csv-text-box");
+    if (old) old.remove();
+    const box = document.createElement("div");
+    box.id = "csv-text-box";
+    box.style.cssText = "position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px";
+    box.innerHTML = '<div style="background:#fff;color:#111;border-radius:14px;padding:16px;width:100%;max-width:560px">'
+      + '<p style="margin:0 0 8px;font-weight:700">CSVの中身（' + filename + '）</p>'
+      + '<p style="margin:0 0 8px;font-size:14px">「コピー」を押して、メモやメールに貼り付けて送ってください。</p>'
+      + '<textarea readonly style="width:100%;height:40vh;font-size:11px;font-family:monospace"></textarea>'
+      + '<div style="display:flex;gap:8px;margin-top:10px">'
+      + '<button type="button" data-act="copy" class="button secondary" style="flex:1">コピー</button>'
+      + '<button type="button" data-act="share" class="button ghost" style="flex:1">共有</button>'
+      + '<button type="button" data-act="close" class="button ghost" style="flex:1">閉じる</button></div></div>';
+    const ta = box.querySelector("textarea");
+    ta.value = csv;
+    const nav = root.navigator || {};
+    const shareBtn = box.querySelector('[data-act="share"]');
+    if (!nav.share) shareBtn.style.display = "none";
+    box.addEventListener("click", async (ev) => {
+      const act = ev.target && ev.target.getAttribute && ev.target.getAttribute("data-act");
+      if (act === "close" || ev.target === box) { box.remove(); return; }
+      if (act === "copy") {
+        let ok = false;
+        try { await nav.clipboard.writeText(csv); ok = true; } catch (e) {
+          ta.focus(); ta.select(); ta.setSelectionRange(0, csv.length);
+          try { ok = document.execCommand("copy"); } catch (e2) { ok = false; }
+        }
+        ev.target.textContent = ok ? "コピーしました" : "長押しで全選択→コピー";
+        if (ok) state.saved = true;
+      }
+      if (act === "share") {
+        try { await nav.share({ title: filename, text: csv }); state.saved = true; } catch (e) { /* 取り消し */ }
+      }
+    });
+    document.body.appendChild(box);
   }
 
   function pulseReport(side) {
