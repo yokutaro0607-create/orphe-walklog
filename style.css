@@ -1067,3 +1067,6 @@ footer {
 .sole-cop{fill:#fff;stroke:#111827;stroke-width:2}
 .sole-label{font-weight:700;margin-top:4px}
 @media (prefers-color-scheme:dark){.sole-outline{fill:#1f2937;stroke:#4b5563}}
+
+.connect-help summary{cursor:pointer}
+.connect-help ol{margin:10px 0 0;padding-left:1.4em;font-size:.92rem;line-height:1.7}
