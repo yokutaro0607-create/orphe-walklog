@@ -373,13 +373,16 @@
         if (act === "share") {
         let file = null;
         try { file = new root.File([csv], filename, { type: "text/csv" }); } catch (e) { file = null; }
-        try {
-          if (file && nav.canShare && nav.canShare({ files: [file] })) await nav.share({ files: [file], title: filename });
-          else await nav.share({ title: filename, text: csv });
-          state.saved = true;
-        } catch (e) {
-          if (!e || e.name !== "AbortError") ev.target.textContent = "共有できません→コピーへ";
+        // ファイルで渡せなければ、文字のまま共有メニューへ（メモ・メール・ファイルに保存を選べる）
+        const tries = [];
+        if (file && nav.canShare && nav.canShare({ files: [file] })) tries.push({ files: [file], title: filename });
+        tries.push({ title: filename, text: csv });
+        let done = false;
+        for (const data of tries) {
+          try { await nav.share(data); done = true; break; } catch (e) { if (e && e.name === "AbortError") { done = true; break; } }
         }
+        if (done) state.saved = true;
+        else ev.target.textContent = "共有できません→コピーへ";
       }
     });
     document.body.appendChild(box);
